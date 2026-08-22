@@ -1,0 +1,16 @@
+# Android / Gradle (watch-app)
+.gradle/
+.idea/
+.kotlin/
+build/
+*.iml
+local.properties
+.DS_Store
+.cxx/
+.externalNativeBuild/
+captures/
+
+# ESP-IDF (firmware-tinyml-ble)
+managed_components/
+sdkconfig.old
+.vscode/

@@ -1,0 +1,25 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 중앙의 위험 감지 점 -->
+    <path
+        android:fillColor="#FF3D00"
+        android:pathData="M 54, 46 a 8,8 0 1,0 0,16 a 8,8 0 1,0 0,-16" />
+
+    <!-- 첫 번째 진동 파동 (선 굵기를 4로 대폭 얇게 조절) -->
+    <path
+        android:strokeColor="#FF6D00"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M 54, 36 a 18,18 0 1,0 0,36 a 18,18 0 1,0 0,-36" />
+
+    <!-- 두 번째 진동 파동 (선 굵기를 4로 대폭 얇게 조절) -->
+    <path
+        android:strokeColor="#FF9100"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M 54, 26 a 28,28 0 1,0 0,56 a 28,28 0 1,0 0,-56" />
+</vector>

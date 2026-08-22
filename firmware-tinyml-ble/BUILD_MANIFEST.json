@@ -1,0 +1,17 @@
+{
+  "project": "GeekbleSound_ESP_IDF_v3_2_RMS_FINAL",
+  "model_bytes": 12192,
+  "mel_nonzero_weights": 495,
+  "hann": "periodic scipy/librosa fftbins=True",
+  "mel": "librosa.filters.mel htk=False norm=slaney dtype=float32",
+  "tflm_component": "espressif/esp-tflite-micro 1.3.5",
+  "runtime_pipeline": [
+    "rms_gate_150",
+    "dc_remove",
+    "rms_target_2500",
+    "gain_clamp_0.25_8",
+    "peak_limit_0.98",
+    "logmel",
+    "int8_tflite"
+  ]
+}

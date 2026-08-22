@@ -1,0 +1,31 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- ◼️ 완벽한 검정색 배경 (고대비) -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M0,0 h108 v108 h-108 z"/>
+
+    <!-- 🎯 중앙의 강렬한 위험 감지 점 (진한 네온 레드/오렌지) -->
+    <path
+        android:fillColor="#FF3D00"
+        android:pathData="M 54, 38 a 16,16 0 1,0 0,32 a 16,16 0 1,0 0,-32" />
+
+    <!-- 〰️ 첫 번째 진동 파동 (레이더 링) -->
+    <path
+        android:strokeColor="#FF6D00"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:pathData="M 54, 22 a 32,32 0 1,0 0,64 a 32,32 0 1,0 0,-64" />
+
+    <!-- 〰️ 두 번째 진동 파동 (퍼져나가는 링) -->
+    <path
+        android:strokeColor="#FF9100"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:pathData="M 54, 6 a 48,48 0 1,0 0,96 a 48,48 0 1,0 0,-96" />
+
+</vector>
