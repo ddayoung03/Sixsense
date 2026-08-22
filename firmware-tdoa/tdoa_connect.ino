@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
 #include "driver/i2s.h"
 #include "arduinoFFT.h"
 
@@ -45,6 +46,28 @@ ArduinoFFT FFT2 = ArduinoFFT(vReal2, vImag2, SAMPLES_PER_READ, FS);
 float x_delay_history[FILTER_SIZE] = {0};
 float y_delay_history[FILTER_SIZE] = {0};
 int filter_idx = 0;
+
+// 최신으로 계산된 각도만 들고 있다가, 2번 보드(TinyML)가 GET_ANGLE을 요청할 때만 응답한다.
+// (예전에는 무조건 브로드캐스트했는데, 그러면 "판단 시점"과 무관한 각도가 붙어버림)
+float last_angle_deg = 0.0f;
+char rx_line[16] = {0};
+size_t rx_used = 0;
+
+void check_angle_request() {
+  while (Serial1.available()) {
+    char c = (char)Serial1.read();
+    if (c == '\n') {
+      rx_line[rx_used] = '\0';
+      if (strncmp(rx_line, "GET_ANGLE", 9) == 0) {
+        Serial1.println(last_angle_deg);
+      }
+      rx_used = 0;
+      continue;
+    }
+    if (c == '\r') continue;
+    if (rx_used < sizeof(rx_line) - 1) rx_line[rx_used++] = c;
+  }
+}
 
 float calculate_energy(const float* buffer, int len) {
   double sum = 0.0;
@@ -92,7 +115,9 @@ int compute_gcc_phat_delay(float* sig1, float* sig2) {
   double corr_sum = 0;
 
   for (int i = 0; i < SAMPLES_PER_READ; i++) {
-    corr_sum += vReal1[i];
+    // 절대값 합산: 그냥 더하면 +/-가 상쇄되어 avg_corr가 0 근처(혹은 음수)가 되고,
+    // 그러면 아래 품질 문턱값이 사실상 무력화되어 노이즈에도 각도가 튀는 원인이 된다.
+    corr_sum += fabsf(vReal1[i]);
     if (vReal1[i] > max_corr) { max_corr = vReal1[i]; delay_index = i; }
   }
 
@@ -132,6 +157,8 @@ void setup() {
 }
 
 void loop() {
+  check_angle_request();
+
   size_t bytes_read0 = 0, bytes_read1 = 0;
   i2s_read(I2S_NUM_0, raw_buf_i2s0, sizeof(raw_buf_i2s0), &bytes_read0, portMAX_DELAY);
   i2s_read(I2S_NUM_1, raw_buf_i2s1, sizeof(raw_buf_i2s1), &bytes_read1, portMAX_DELAY);
@@ -170,9 +197,9 @@ void loop() {
   float angle_deg = atan2f(avg_x, avg_y) * (180.0f / M_PI);
   if (angle_deg < 0.0f) angle_deg += 360.0f;
 
-  // 2번 보드(TinyML 보드)로 계산된 각도를 전송
-  Serial1.println(angle_deg);
-  
+  // 무조건 전송하지 않고 최신 각도만 보관 -> 2번 보드가 GET_ANGLE로 요청할 때 응답
+  last_angle_deg = angle_deg;
+
   // 시리얼 모니터 확인용 출력
-  Serial.print("전송된 각도: "); Serial.println(angle_deg);
+  Serial.print("계산된 각도: "); Serial.println(angle_deg);
 }

@@ -42,9 +42,11 @@ constexpr char TAG[] = "GEEKBLE_AI";
 
 // -----------------------------------------------------------------------------
 // BLE: same Service / Characteristic UUIDs as BLE_connect_namming.ino.
-// Payload format sent to the watch: "angle,horn" or "angle,siren".
-// Angle is received from another ESP32 over UART. Until the first valid angle
-// arrives, 90 degrees is used as a safe default.
+// Payload format sent to the watch: "horn,angle" or "siren,angle".
+// The angle is fetched synchronously from the other ESP32 (GET_ANGLE request
+// over UART) at the moment a sound is classified, so it matches this specific
+// event instead of whatever angle last happened to arrive in the background.
+// If the request times out, 90 degrees is used as a safe default.
 // -----------------------------------------------------------------------------
 constexpr float DEFAULT_ANGLE_DEG = 90.0f;
 
@@ -82,9 +84,7 @@ static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t ble_char_val_handle = 0;
 static volatile bool ble_notify_enabled = false;
 static char ble_device_name[40] = "ESP32_AUDIO_ALERT";
-static char ble_last_payload[32] = "90.0,none";
-static volatile float latest_angle_deg = DEFAULT_ANGLE_DEG;
-static volatile bool angle_received = false;
+static char ble_last_payload[32] = "none, 90.0";
 static ble_gatt_chr_def ble_characteristics[2] = {};
 static ble_gatt_svc_def ble_services[2] = {};
 
@@ -99,7 +99,7 @@ constexpr float MIC_GAIN = 1.0f;
 // -----------------------------------------------------------------------------
 // v3.2 runtime RMS normalization: MUST match training model_info.json.
 // -----------------------------------------------------------------------------
-constexpr float RMS_GATE_PCM16 =50.0f;
+constexpr float RMS_GATE_PCM16 = 150.0f;  // must match model_info.json runtime_rms_normalization.gate_pcm16
 constexpr float RMS_TARGET_PCM16 = 2500.0f;
 constexpr float RMS_NORM_MIN_GAIN = 0.25f;
 constexpr float RMS_NORM_MAX_GAIN = 8.0f;
@@ -114,6 +114,12 @@ constexpr float MIN_CONFIDENCE = 0.75f;
 constexpr uint32_t SAMPLE_RATE = 16000;
 constexpr uint32_t WINDOW_SECONDS = 2;
 constexpr uint32_t SAMPLE_COUNT = SAMPLE_RATE * WINDOW_SECONDS;
+// Sliding-window hop: after the initial 2s fill, only this many *new* samples
+// are captured before the next inference (on the latest rolling 2s window),
+// instead of blocking a fresh 2s each time. Cuts worst-case reaction latency
+// from ~4s down to roughly HOP_SAMPLES + inference time, with no retraining
+// needed since the model still sees a full 2s of context every time.
+constexpr uint32_t HOP_SAMPLES = SAMPLE_RATE / 2;  // 0.5s hop
 constexpr uint16_t FFT_SIZE = 512;
 constexpr uint16_t FFT_BINS = FFT_SIZE / 2 + 1;
 constexpr uint16_t HOP_LENGTH = 256;
@@ -137,7 +143,9 @@ constexpr bool ENABLE_FEATURE_DEBUG = true;
 constexpr bool ENABLE_OUTPUT_DEBUG = true;
 
 uint8_t* tensor_arena = nullptr;
-int16_t* audio_pcm = nullptr;
+int16_t* audio_pcm = nullptr;   // linear snapshot of the latest 2s window (chronological order)
+int16_t* ring_pcm = nullptr;    // continuously-filled circular capture buffer, size SAMPLE_COUNT
+uint32_t ring_write_pos = 0;
 float* log_mel_buffer = nullptr;
 
 float fft_real[FFT_SIZE];
@@ -155,6 +163,7 @@ TfLiteTensor* output_tensor = nullptr;
 // BLE GATT server
 // -----------------------------------------------------------------------------
 static void ble_start_advertising();
+static bool request_angle_sync(float& angle_out);
 
 static int ble_gatt_access(uint16_t conn_handle, uint16_t attr_handle,
                            ble_gatt_access_ctxt* ctxt, void* arg) {
@@ -344,11 +353,11 @@ static bool init_ble() {
 static bool ble_send_sound(const char* sound_name) {
     if (!sound_name) return false;
 
-    // Two values in one notification: angle,sound. The angle is the latest
-    // value received from the other ESP32 over UART.
-    const float angle = latest_angle_deg;
-    if (!angle_received) {
-        ESP_LOGW(TAG, "No UART angle received yet; using default %.1f ", angle);
+    // Ask the TDOA board for its angle right now, at classification time,
+    // instead of relying on a stale background UART cache.
+    float angle = DEFAULT_ANGLE_DEG;
+    if (!request_angle_sync(angle)) {
+        ESP_LOGW(TAG, "GET_ANGLE request timed out; using default %.1f", angle);
     }
     std::snprintf(ble_last_payload, sizeof(ble_last_payload),
                   "%s, %.1f", sound_name, angle);
@@ -425,56 +434,55 @@ static bool parse_angle_line(char* line, float& angle_out) {
     return true;
 }
 
-static void angle_uart_task(void* arg) {
-    (void)arg;
+// Sends "GET_ANGLE\n" to the TDOA board and blocks briefly for its reply, so
+// the direction we report matches this specific classification event instead
+// of whatever angle last happened to arrive in the background (see the
+// synchronization discussion this replaces: the old design just cached
+// whatever angle streamed in most recently, which could be stale by up to a
+// full 2s capture window relative to the sound that was actually classified).
+static bool request_angle_sync(float& angle_out) {
+    uart_flush_input(ANGLE_UART_PORT);
+
+    static const char kRequest[] = "GET_ANGLE\n";
+    uart_write_bytes(ANGLE_UART_PORT, kRequest, std::strlen(kRequest));
 
     char line[32] = {};
     size_t used = 0;
     uint8_t ch = 0;
+    const int64_t deadline_us = esp_timer_get_time() + 200000;  // 200ms timeout
 
-    while (true) {
-        const int n = uart_read_bytes(
-            ANGLE_UART_PORT, &ch, 1, pdMS_TO_TICKS(100));
-
+    while (esp_timer_get_time() < deadline_us) {
+        const int n = uart_read_bytes(ANGLE_UART_PORT, &ch, 1, pdMS_TO_TICKS(20));
         if (n <= 0) {
             continue;
         }
 
-        // Same framing as Serial1.readStringUntil('\n').
         if (ch == '\n') {
             if (used == 0) {
                 continue;
             }
-
             line[used] = '\0';
-
             float angle = 0.0f;
             if (parse_angle_line(line, angle)) {
-                latest_angle_deg = angle;
-                angle_received = true;
-                ESP_LOGI(TAG, "UART angle RX -> %.1f deg", angle);
-            } else {
-                ESP_LOGW(TAG, "Invalid UART angle frame: '%s'", line);
+                angle_out = angle;
+                return true;
             }
-
+            ESP_LOGW(TAG, "Invalid UART angle frame: '%s'", line);
             used = 0;
             line[0] = '\0';
             continue;
         }
-
-        // Ignore CR so both "\n" and "\r\n" senders work.
         if (ch == '\r') {
             continue;
         }
-
         if (used < sizeof(line) - 1) {
             line[used++] = static_cast<char>(ch);
         } else {
-            ESP_LOGW(TAG, "UART angle frame too long; dropping");
             used = 0;
             line[0] = '\0';
         }
     }
+    return false;
 }
 
 static bool init_angle_uart() {
@@ -514,15 +522,8 @@ static bool init_angle_uart() {
     // Drop any stale bytes that arrived during boot.
     uart_flush_input(ANGLE_UART_PORT);
 
-    const BaseType_t task_ok = xTaskCreate(
-        angle_uart_task, "angle_uart", 3072, nullptr, 5, nullptr);
-    if (task_ok != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create angle UART task");
-        return false;
-    }
-
     ESP_LOGI(TAG,
-             "Angle UART ready: UART%d %d bps 8N1, RX=GPIO%d(D0/RX) TX=GPIO%d(D1/TX), default=%.1f deg",
+             "Angle UART ready (request/response): UART%d %d bps 8N1, RX=GPIO%d(D0/RX) TX=GPIO%d(D1/TX), default=%.1f deg",
              static_cast<int>(ANGLE_UART_PORT), ANGLE_UART_BAUD,
              ANGLE_UART_RX_PIN, ANGLE_UART_TX_PIN, DEFAULT_ANGLE_DEG);
     return true;
@@ -601,10 +602,12 @@ bool allocate_buffers() {
 
     audio_pcm = static_cast<int16_t*>(
         alloc_prefer_psram(SAMPLE_COUNT * sizeof(int16_t), "PCM buffer"));
+    ring_pcm = static_cast<int16_t*>(
+        alloc_prefer_psram(SAMPLE_COUNT * sizeof(int16_t), "Ring PCM buffer"));
     log_mel_buffer = static_cast<float*>(
         alloc_prefer_psram(FEATURE_COUNT * sizeof(float), "Log-Mel buffer"));
 
-    if (!tensor_arena || !audio_pcm || !log_mel_buffer) {
+    if (!tensor_arena || !audio_pcm || !ring_pcm || !log_mel_buffer) {
         ESP_LOGE(TAG, "Buffer allocation failed. Check QSPI PSRAM settings.");
         return false;
     }
@@ -778,14 +781,15 @@ bool init_microphone() {
     return true;
 }
 
-bool capture_two_seconds(float& rms_out) {
+// Reads `n_samples` fresh samples from the mic into the ring buffer, wrapping
+// as needed. Used both for the one-time initial 2s fill and for each
+// HOP_SAMPLES top-up between inferences (sliding window).
+bool capture_chunk_into_ring(uint32_t n_samples, int16_t& minimum, int16_t& maximum) {
     constexpr size_t CHUNK = 256;
     int32_t raw[CHUNK];
     uint32_t captured = 0;
-    int16_t minimum = INT16_MAX;
-    int16_t maximum = INT16_MIN;
 
-    while (captured < SAMPLE_COUNT) {
+    while (captured < n_samples) {
         size_t bytes_read = 0;
         const esp_err_t err = i2s_channel_read(
             rx_handle, raw, sizeof(raw), &bytes_read, pdMS_TO_TICKS(1000));
@@ -796,21 +800,29 @@ bool capture_two_seconds(float& rms_out) {
         }
 
         const size_t samples_read = bytes_read / sizeof(raw[0]);
-        const size_t copy_count = std::min<size_t>(samples_read, SAMPLE_COUNT - captured);
+        const size_t copy_count = std::min<size_t>(samples_read, n_samples - captured);
         for (size_t i = 0; i < copy_count; ++i) {
             const int32_t pcm16_raw = raw[i] >> 16;
             float scaled = static_cast<float>(pcm16_raw) * MIC_GAIN;
             scaled = clamp_float(scaled, -32768.0f, 32767.0f);
             const int16_t sample = static_cast<int16_t>(std::lround(scaled));
-            audio_pcm[captured++] = sample;
+            ring_pcm[ring_write_pos] = sample;
+            ring_write_pos = (ring_write_pos + 1) % SAMPLE_COUNT;
             minimum = std::min(minimum, sample);
             maximum = std::max(maximum, sample);
+            ++captured;
         }
     }
+    return true;
+}
 
-    if (minimum >= -1 && maximum <= 0) {
-        ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
-        return false;
+// Unwraps the most recent SAMPLE_COUNT samples from the ring buffer into
+// `audio_pcm` in chronological order (oldest -> newest) and computes their
+// RMS. Downstream code (normalization, Log-Mel) is unchanged: it just reads
+// audio_pcm[] linearly like before.
+void snapshot_window_and_rms(float& rms_out) {
+    for (uint32_t i = 0; i < SAMPLE_COUNT; ++i) {
+        audio_pcm[i] = ring_pcm[(ring_write_pos + i) % SAMPLE_COUNT];
     }
 
     int64_t sum = 0;
@@ -822,9 +834,6 @@ bool capture_two_seconds(float& rms_out) {
         squares += centered * centered;
     }
     rms_out = static_cast<float>(std::sqrt(squares / static_cast<double>(SAMPLE_COUNT)));
-    std::printf("PCM16 min=%d max=%d raw_RMS=%.2f\n",
-                static_cast<int>(minimum), static_cast<int>(maximum), rms_out);
-    return true;
 }
 
 // Exact runtime equivalent of v3.2 normalize_rms_pcm16():
@@ -1014,14 +1023,42 @@ extern "C" void app_main(void) {
     if (!init_angle_uart()) stop_forever("Angle UART initialization failed");
     if (!init_microphone()) stop_forever("INMP441 initialization failed");
 
-    ESP_LOGI(TAG, "Ready. Capturing 2-second windows...");
-
-    while (true) {
-        float raw_rms = 0.0f;
-        if (!capture_two_seconds(raw_rms)) {
+    ESP_LOGI(TAG, "Filling initial 2-second window...");
+    for (;;) {
+        int16_t init_min = INT16_MAX, init_max = INT16_MIN;
+        if (!capture_chunk_into_ring(SAMPLE_COUNT, init_min, init_max)) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
+        if (init_min >= -1 && init_max <= 0) {
+            ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        break;
+    }
+    ESP_LOGI(TAG, "Ready. Sliding %.1fs window, %.2fs hop...",
+             static_cast<double>(WINDOW_SECONDS),
+             static_cast<double>(HOP_SAMPLES) / SAMPLE_RATE);
+
+    while (true) {
+        // Only top up HOP_SAMPLES of *new* audio each cycle instead of
+        // blocking a fresh 2s window every time -> the rolling window slides
+        // forward and worst-case reaction latency drops to roughly one hop
+        // instead of up to ~4s.
+        int16_t minimum = INT16_MAX, maximum = INT16_MIN;
+        if (!capture_chunk_into_ring(HOP_SAMPLES, minimum, maximum)) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (minimum >= -1 && maximum <= 0) {
+            ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        float raw_rms = 0.0f;
+        snapshot_window_and_rms(raw_rms);
 
         // Step 1: noise gate BEFORE normalization, exactly as runtime spec.
         if (raw_rms < RMS_GATE_PCM16) {
