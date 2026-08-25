@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.content.SharedPreferences
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -40,6 +41,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -66,7 +68,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var initialAzimuth = 0f
 
     private val isConnected = mutableStateOf(false)
+    private val isConnecting = mutableStateOf(false)
     private val isScanning = mutableStateOf(false)
+    private var userInitiatedDisconnect = false
+    private var reconnectAttempts = 0
+    private val maxReconnectAttempts = 3
 
     private val scannedDevicesMap = mutableStateMapOf<String, BluetoothDevice>()
     private val deviceTimestamps = mutableMapOf<String, Long>()
@@ -81,8 +87,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val alertColor = mutableStateOf(Color(0xFFFF1744))
     private val vibeStrength = mutableStateOf(1)
 
+    private lateinit var settingsPrefs: SharedPreferences
+
+    private var savedDeviceAddress: String?
+        get() = settingsPrefs.getString("last_device_address", null)
+        set(value) { settingsPrefs.edit().putString("last_device_address", value).apply() }
+
+    private var savedDeviceName: String?
+        get() = settingsPrefs.getString("last_device_name", null)
+        set(value) { settingsPrefs.edit().putString("last_device_name", value).apply() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        settingsPrefs = getSharedPreferences("sixsense_settings", Context.MODE_PRIVATE)
+        clockColor.value = Color(settingsPrefs.getInt("clock_color", clockColor.value.toArgb()))
+        alertColor.value = Color(settingsPrefs.getInt("alert_color", alertColor.value.toArgb()))
+        vibeStrength.value = settingsPrefs.getInt("vibe_strength", vibeStrength.value)
 
         setShowWhenLocked(true)
         setTurnScreenOn(true)
@@ -102,6 +123,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         ) { permissions ->
             if (!permissions.entries.all { it.value }) {
                 Log.e("BLE", "권한 거부됨")
+            } else {
+                tryAutoReconnect()
             }
         }
 
@@ -154,16 +177,24 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     onOpenSettings = { isSettingsOpen.value = true },
                     onCloseSettings = { isSettingsOpen.value = false },
                     onDisconnect = { disconnectFromDevice() },
-                    onClockColorChange = { clockColor.value = it },
-                    onAlertColorChange = { alertColor.value = it },
+                    onClockColorChange = {
+                        clockColor.value = it
+                        settingsPrefs.edit().putInt("clock_color", it.toArgb()).apply()
+                    },
+                    onAlertColorChange = {
+                        alertColor.value = it
+                        settingsPrefs.edit().putInt("alert_color", it.toArgb()).apply()
+                    },
                     onVibeChange = {
                         vibeStrength.value = it
+                        settingsPrefs.edit().putInt("vibe_strength", it).apply()
                         triggerHapticFeedback(this@MainActivity, it)
                     }
                 )
             } else {
                 ConnectScreen(
                     isScanning = isScanning.value,
+                    isConnecting = isConnecting.value,
                     devices = scannedDevicesMap.values.toList(),
                     onStartScan = { startBleScan() },
                     onDeviceClick = { device -> connectToDevice(device) }
@@ -243,17 +274,37 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     @SuppressLint("MissingPermission")
     private fun connectToDevice(device: BluetoothDevice) {
         isScanning.value = false
+        isConnecting.value = true
         scanner?.stopScan(scanCallback)
-        connectedDeviceName.value = device.name ?: "알 수 없는 기기"
+        connectedDeviceName.value = device.name ?: savedDeviceName ?: "알 수 없는 기기"
         bluetoothGatt = device.connectGatt(this, false, gattCallback)
     }
 
     @SuppressLint("MissingPermission")
+    private fun tryAutoReconnect() {
+        val address = savedDeviceAddress ?: return
+        if (reconnectAttempts >= maxReconnectAttempts) return
+        reconnectAttempts++
+        try {
+            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            val adapter = bluetoothManager.adapter
+            if (adapter == null || !adapter.isEnabled) return
+            connectToDevice(adapter.getRemoteDevice(address))
+        } catch (e: Exception) {
+            Log.e("BLE", "자동 재연결 실패: ${e.message}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun disconnectFromDevice() {
+        userInitiatedDisconnect = true
+        savedDeviceAddress = null
+        savedDeviceName = null
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
         isConnected.value = false
+        isConnecting.value = false
         isSettingsOpen.value = false
     }
 
@@ -263,7 +314,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                gatt.close()
                 isConnected.value = false
+                if (userInitiatedDisconnect) {
+                    userInitiatedDisconnect = false
+                    isConnecting.value = false
+                } else {
+                    tryAutoReconnect()
+                }
             }
         }
 
@@ -280,6 +338,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         gatt.writeDescriptor(descriptor)
                         isConnected.value = true
+                        isConnecting.value = false
+                        reconnectAttempts = 0
+                        savedDeviceAddress = gatt.device.address
+                        gatt.device.name?.let { savedDeviceName = it }
                     }
                 }
             }
@@ -357,6 +419,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 @Composable
 fun ConnectScreen(
     isScanning: Boolean,
+    isConnecting: Boolean,
     devices: List<BluetoothDevice>,
     onStartScan: () -> Unit,
     onDeviceClick: (BluetoothDevice) -> Unit
@@ -366,7 +429,9 @@ fun ConnectScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        if (!isScanning && devices.isEmpty()) {
+        if (isConnecting) {
+            Text("이전 기기에 재연결 중...", color = Color.White, fontSize = 14.sp)
+        } else if (!isScanning && devices.isEmpty()) {
             Box(
                 modifier = Modifier.background(Color.DarkGray, RoundedCornerShape(20.dp)).clickable { onStartScan() }.padding(16.dp)
             ) { Text("기기 검색 시작", color = Color.White, fontSize = 16.sp) }
