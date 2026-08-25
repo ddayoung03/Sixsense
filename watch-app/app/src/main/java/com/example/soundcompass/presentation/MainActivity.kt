@@ -17,6 +17,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -156,7 +159,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
             LaunchedEffect(isAlertActive.value, alertSoundType.value, alertAngle.value) {
                 if (isAlertActive.value) {
-                    delay(5000)
+                    // The board only notifies while it's actively re-confirming the
+                    // sound (every ~0.25s), so a stopped stream of notifications
+                    // itself means the sound has stopped - this timeout just needs
+                    // to cover a couple of missed BLE packets, not act as the
+                    // primary detector. Was 5000ms, which made the alert visibly
+                    // linger after the sound actually ended.
+                    delay(1500)
                     isAlertActive.value = false
                 }
             }
@@ -206,7 +215,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         rotationSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
     }
 
@@ -219,13 +228,28 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (event?.sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
             val rotationMatrix = FloatArray(9)
             SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
+            // getOrientation()'s azimuth is defined for a device lying flat
+            // (screen up); a watch is actually viewed tilted toward the wearer's
+            // face, so the raw azimuth is off by however much the wrist is
+            // raised. Remap to the "held upright, screen facing the wearer"
+            // frame (the standard compass-app mapping) before reading azimuth,
+            // per https://developer.android.com/develop/sensors-and-location/sensors/sensors_position.
+            val remappedMatrix = FloatArray(9)
+            SensorManager.remapCoordinateSystem(
+                rotationMatrix, SensorManager.AXIS_X, SensorManager.AXIS_Z, remappedMatrix
+            )
+
             val orientationAngles = FloatArray(3)
-            SensorManager.getOrientation(rotationMatrix, orientationAngles)
+            SensorManager.getOrientation(remappedMatrix, orientationAngles)
 
             var azimuth = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
             if (azimuth < 0) azimuth += 360f
 
-            currentAzimuth.value = azimuth
+            // Low-pass filter over the shortest angular path so raw sensor jitter
+            // doesn't show up as small steps in the direction indicator.
+            val shortestDelta = ((azimuth - currentAzimuth.value + 540f) % 360f) - 180f
+            currentAzimuth.value = (currentAzimuth.value + shortestDelta * 0.35f + 360f) % 360f
         }
     }
 
@@ -562,13 +586,24 @@ fun AlertScreen(soundType: String, angle: Float, themeColor: Color) {
     val cleanSoundType = soundType.trim().uppercase()
     val alertIcon = if (cleanSoundType == "SIREN") Icons.Default.NotificationsActive else Icons.Default.VolumeUp
 
+    // Animate toward the new angle along the shortest path instead of snapping,
+    // so both new BLE readings and watch rotation feel like continuous motion.
+    val animatedAngle = remember { Animatable(angle) }
+    LaunchedEffect(angle) {
+        val shortestDelta = ((angle - animatedAngle.value + 540f) % 360f) - 180f
+        animatedAngle.animateTo(
+            animatedAngle.value + shortestDelta,
+            animationSpec = tween(durationMillis = 150, easing = LinearEasing)
+        )
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             val strokeWidth = 25f
             drawCircle(color = Color.DarkGray, style = Stroke(width = strokeWidth))
             drawArc(
                 color = themeColor,
-                startAngle = angle - 90f - 30f,
+                startAngle = animatedAngle.value - 90f - 30f,
                 sweepAngle = 60f,
                 useCenter = false,
                 style = Stroke(width = strokeWidth)

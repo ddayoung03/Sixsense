@@ -24,18 +24,24 @@
 #define SOUND_SPEED_MPS     343.0f    
 // 💡 만약 너무 작은 소리에도 반응해서 각도가 튄다면 이 값을 키우고(예: 1.0e-5f), 
 // 소리를 잘 못 잡으면 이 값을 줄여주세요(예: 1.0e-6f).
-#define ENERGY_THRESH       5.0e-6f   
-#define CORR_QUALITY_THRESH 1.8f      
-#define FILTER_SIZE         8         
+#define ENERGY_THRESH       5.0e-6f
+#define CORR_QUALITY_THRESH 1.8f
+// 💡 0에 가까울수록 부드럽지만(잡음에 강하지만) 소리가 움직일 때 반응이 느려지고,
+// 1에 가까울수록 반응은 빠르지만 잡음(떨림)이 그대로 각도에 드러납니다.
+#define DELAY_EMA_ALPHA     0.35f
 #define USE_BANDPASS        true
 #define MIN_FREQ            200.0f
 #define MAX_FREQ            5000.0f
+// 💡 보드가 몸에 장착된 각도 때문에 실제 방향과 표시 각도가 일정하게 어긋난다면
+// (예: 실제로는 정면인데 항상 15도쯤 오른쪽으로 나온다면) 이 값을 조정하세요.
+// 표시 각도 = 계산된 각도 + 이 값 (도 단위, 음수도 가능).
+#define ANGLE_CALIBRATION_OFFSET_DEG 0.0f
 
-int32_t raw_buf_i2s0[SAMPLES_PER_READ * 2]; 
-int32_t raw_buf_i2s1[SAMPLES_PER_READ * 2]; 
+int32_t raw_buf_i2s0[SAMPLES_PER_READ * 2];
+int32_t raw_buf_i2s1[SAMPLES_PER_READ * 2];
 
-float buf_E[SAMPLES_PER_READ], buf_W[SAMPLES_PER_READ]; 
-float buf_S[SAMPLES_PER_READ], buf_N[SAMPLES_PER_READ]; 
+float buf_E[SAMPLES_PER_READ], buf_W[SAMPLES_PER_READ];
+float buf_S[SAMPLES_PER_READ], buf_N[SAMPLES_PER_READ];
 
 float vReal1[SAMPLES_PER_READ], vImag1[SAMPLES_PER_READ];
 float vReal2[SAMPLES_PER_READ], vImag2[SAMPLES_PER_READ];
@@ -43,9 +49,11 @@ float vReal2[SAMPLES_PER_READ], vImag2[SAMPLES_PER_READ];
 ArduinoFFT FFT1 = ArduinoFFT(vReal1, vImag1, SAMPLES_PER_READ, FS);
 ArduinoFFT FFT2 = ArduinoFFT(vReal2, vImag2, SAMPLES_PER_READ, FS);
 
-float x_delay_history[FILTER_SIZE] = {0};
-float y_delay_history[FILTER_SIZE] = {0};
-int filter_idx = 0;
+// 예전에는 최근 8개 표본을 단순평균했는데(FILTER_SIZE), 그러면 창(윈도우) 절반 크기만큼
+// (~250-400ms) 지연이 생겨서 소리가 움직일 때 표시 각도가 실제보다 뒤처졌습니다.
+// 지수이동평균(EMA)은 같은 수준의 잡음 억제력에서 지연이 훨씬 짧습니다.
+float ema_delay_x = 0.0f, ema_delay_y = 0.0f;
+bool ema_initialized = false;
 
 // 최신으로 계산된 각도만 들고 있다가, 2번 보드(TinyML)가 GET_ANGLE을 요청할 때만 응답한다.
 // (예전에는 무조건 브로드캐스트했는데, 그러면 "판단 시점"과 무관한 각도가 붙어버림)
@@ -185,16 +193,19 @@ void loop() {
   int max_delay = (int)ceilf((DISTANCE_MICS_M / SOUND_SPEED_MPS) * FS);
   if (abs(delay_x) > max_delay + 2 || abs(delay_y) > max_delay + 2) return;
 
-  x_delay_history[filter_idx] = (float)delay_x;
-  y_delay_history[filter_idx] = (float)delay_y;
-  filter_idx = (filter_idx + 1) % FILTER_SIZE;
+  if (!ema_initialized) {
+    ema_delay_x = (float)delay_x;
+    ema_delay_y = (float)delay_y;
+    ema_initialized = true;
+  } else {
+    ema_delay_x += DELAY_EMA_ALPHA * ((float)delay_x - ema_delay_x);
+    ema_delay_y += DELAY_EMA_ALPHA * ((float)delay_y - ema_delay_y);
+  }
 
-  float avg_x = 0.0f, avg_y = 0.0f;
-  for (int i = 0; i < FILTER_SIZE; i++) { avg_x += x_delay_history[i]; avg_y += y_delay_history[i]; }
-  avg_x /= FILTER_SIZE; avg_y /= FILTER_SIZE;
-
-  // 💡 [수정됨] 북쪽(N)을 0도, 동쪽(E)을 90도로 설정하기 위해 atan2f의 인자 순서를 (avg_x, avg_y)로 변경
-  float angle_deg = atan2f(avg_x, avg_y) * (180.0f / M_PI);
+  // 💡 [수정됨] 북쪽(N)을 0도, 동쪽(E)을 90도로 설정하기 위해 atan2f의 인자 순서를 (ema_delay_x, ema_delay_y)로 변경
+  float angle_deg = atan2f(ema_delay_x, ema_delay_y) * (180.0f / M_PI);
+  angle_deg += ANGLE_CALIBRATION_OFFSET_DEG;
+  angle_deg = fmodf(angle_deg, 360.0f);
   if (angle_deg < 0.0f) angle_deg += 360.0f;
 
   // 무조건 전송하지 않고 최신 각도만 보관 -> 2번 보드가 GET_ANGLE로 요청할 때 응답

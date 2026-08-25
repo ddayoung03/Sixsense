@@ -51,6 +51,20 @@ constexpr char TAG[] = "GEEKBLE_AI";
 constexpr float DEFAULT_ANGLE_DEG = 90.0f;
 
 // -----------------------------------------------------------------------------
+// A previous version of this file streamed angle-only BLE notifications at a
+// fast fixed interval for a few seconds after each confident detection, to
+// keep the watch's direction indicator moving smoothly between classification
+// hops. It was removed: it kept reporting the last-seen sound for a few
+// seconds after the sound actually stopped (regardless of whether the
+// classifier still agreed), which combined with the watch's own dismiss timer
+// made the alert/vibration linger for several seconds after the danger sound
+// ended. Reaction speed (both "alert appears" and "alert clears") matters
+// more here than a perfectly smooth arrow, so notifications are now sent only
+// when the classification loop itself confidently detects a sound - nothing
+// keeps reporting once that stops being true.
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
 // Angle UART link - matched to tinyml_BLE.ino Serial1.begin(115200, 8N1, RX, TX)
 // on Geekble nano ESP32-S3.
 //
@@ -119,7 +133,12 @@ constexpr uint32_t SAMPLE_COUNT = SAMPLE_RATE * WINDOW_SECONDS;
 // instead of blocking a fresh 2s each time. Cuts worst-case reaction latency
 // from ~4s down to roughly HOP_SAMPLES + inference time, with no retraining
 // needed since the model still sees a full 2s of context every time.
-constexpr uint32_t HOP_SAMPLES = SAMPLE_RATE / 2;  // 0.5s hop
+// 0.25s (was 0.5s): both "alert appears" and "confidence drops back below
+// threshold" are re-checked twice as often. Watch the printed
+// Preprocess/Inference times after flashing - if their sum creeps past this
+// hop's duration, inference is falling behind real time and this needs to
+// go back up.
+constexpr uint32_t HOP_SAMPLES = SAMPLE_RATE / 4;  // 0.25s hop
 constexpr uint16_t FFT_SIZE = 512;
 constexpr uint16_t FFT_BINS = FFT_SIZE / 2 + 1;
 constexpr uint16_t HOP_LENGTH = 256;
