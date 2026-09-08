@@ -1,5 +1,5 @@
 {
-  "version": "real_world_robust_v3_2_rms_normalized",
+  "version": "honk_robust_v4_lowsnr",
   "classes": [
     "horn",
     "noise",
@@ -12,15 +12,12 @@
   "n_fft": 512,
   "hop_length": 256,
   "n_mels": 64,
-  "fmin": 50,
-  "fmax": 8000,
+  "fmin": 50.0,
+  "fmax": 8000.0,
   "min_db": -80.0,
   "max_db": 20.0,
-  "feature_shape": [
-    64,
-    126,
-    1
-  ],
+  "time_frames": 126,
+  "feature_mean_sub": -32.214847564697266,
   "minimum_confidence": 0.75,
   "runtime_rms_normalization": {
     "enabled": true,
@@ -30,23 +27,9 @@
     "max_gain": 8.0,
     "peak_limit_float": 0.98
   },
-  "augmentation": {
-    "copies_per_original": 2,
-    "pre_normalization_gain_db_min": -18.0,
-    "pre_normalization_gain_db_max": 12.0,
-    "train_target_rms_min": 2200.0,
-    "train_target_rms_max": 2800.0,
-    "post_normalization_gain_db_min": -2.0,
-    "post_normalization_gain_db_max": 2.0,
-    "max_time_shift_seconds": 0.6,
-    "random_crop_for_train": true,
-    "noise_probability": 0.5,
-    "noise_snr_db_min": 18.0,
-    "noise_snr_db_max": 35.0
-  },
   "tflite_input_quantization": {
-    "scale": 0.3710634410381317,
-    "zero_point": 79
+    "scale": 0.3810134530067444,
+    "zero_point": 76
   },
   "tflite_output_quantization": {
     "scale": 0.00390625,

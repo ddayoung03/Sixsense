@@ -14,3 +14,9 @@ captures/
 managed_components/
 sdkconfig.old
 .vscode/
+build_run.log
+*.bak
+
+# secrets / local
+.ent
+.env

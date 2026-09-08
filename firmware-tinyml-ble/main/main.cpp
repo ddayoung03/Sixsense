@@ -103,11 +103,12 @@ static ble_gatt_chr_def ble_characteristics[2] = {};
 static ble_gatt_svc_def ble_services[2] = {};
 
 // -----------------------------------------------------------------------------
-// Geekble Nano ESP32-S3 + INMP441 wiring that previously worked.
+// Geekble Nano ESP32-S3 + INMP441 wiring. Nano pin map: D2=GPIO5, D3=GPIO6,
+// D4=GPIO7. Matches actual as-wired unit: SCK->D4, WS->D3, SD->D2.
 // -----------------------------------------------------------------------------
-constexpr int I2S_PIN_WS  = 5;   // Geekble D4
-constexpr int I2S_PIN_SCK = 6;   // Geekble D3
-constexpr int I2S_PIN_SD  = 7;   // Geekble D2
+constexpr int I2S_PIN_WS  = 6;   // Geekble D3
+constexpr int I2S_PIN_SCK = 7;   // Geekble D4
+constexpr int I2S_PIN_SD  = 5;   // Geekble D2
 constexpr float MIC_GAIN = 1.0f;
 
 // -----------------------------------------------------------------------------
@@ -119,6 +120,15 @@ constexpr float RMS_NORM_MIN_GAIN = 0.25f;
 constexpr float RMS_NORM_MAX_GAIN = 8.0f;
 constexpr float RMS_PEAK_LIMIT_FLOAT = 0.98f;
 constexpr float MIN_CONFIDENCE = 0.75f;
+
+// A single confident window isn't enough to alert: a car horn is basically a
+// plain sustained tone, acoustically the least distinctive of the 3 classes,
+// so a transient tonal moment in music/speech occasionally spikes past
+// MIN_CONFIDENCE for one window. A real horn/siren easily lasts long enough
+// to hit this many consecutive windows in a row; a one-off coincidence
+// doesn't. Costs ~(CONSECUTIVE_REQUIRED-1) hops of extra latency before the
+// first alert of a new event.
+constexpr int CONSECUTIVE_REQUIRED = 2;
 
 // -----------------------------------------------------------------------------
 // v3.2 model / feature parameters.
@@ -133,12 +143,12 @@ constexpr uint32_t SAMPLE_COUNT = SAMPLE_RATE * WINDOW_SECONDS;
 // instead of blocking a fresh 2s each time. Cuts worst-case reaction latency
 // from ~4s down to roughly HOP_SAMPLES + inference time, with no retraining
 // needed since the model still sees a full 2s of context every time.
-// 0.25s (was 0.5s): both "alert appears" and "confidence drops back below
-// threshold" are re-checked twice as often. Watch the printed
-// Preprocess/Inference times after flashing - if their sum creeps past this
-// hop's duration, inference is falling behind real time and this needs to
-// go back up.
-constexpr uint32_t HOP_SAMPLES = SAMPLE_RATE / 4;  // 0.25s hop
+// 0.5s (was 0.25s): measured Preprocess+Inference (~510ms) exceeded the
+// 0.25s hop and the 128ms I2S DMA buffer (8 desc x 256 frames), causing
+// audio to be dropped/overrun every cycle instead of actually reacting
+// faster. Watch the printed Preprocess/Inference times after flashing - if
+// their sum creeps past this hop's duration, it needs to go back up again.
+constexpr uint32_t HOP_SAMPLES = SAMPLE_RATE / 2;  // 0.5s hop
 constexpr uint16_t FFT_SIZE = 512;
 constexpr uint16_t FFT_BINS = FFT_SIZE / 2 + 1;
 constexpr uint16_t HOP_LENGTH = 256;
@@ -152,8 +162,8 @@ constexpr float POWER_FLOOR = 1.0e-10f;
 constexpr float TOP_DB = 80.0f;
 
 // Values exported in the uploaded v3.2 model_info.json.
-constexpr float EXPECTED_INPUT_SCALE = 0.3710634410381317f;
-constexpr int EXPECTED_INPUT_ZERO_POINT = 79;
+constexpr float EXPECTED_INPUT_SCALE = 0.3810134530067444f;
+constexpr int EXPECTED_INPUT_ZERO_POINT = 76;
 constexpr float EXPECTED_OUTPUT_SCALE = 0.00390625f;
 constexpr int EXPECTED_OUTPUT_ZERO_POINT = -128;
 
@@ -1113,15 +1123,23 @@ extern "C" void app_main(void) {
 
         // Step 5: send danger sound result to the watch over BLE.
         // Noise and uncertain predictions are intentionally not notified.
+        // Also require CONSECUTIVE_REQUIRED windows in a row to agree before
+        // alerting, to filter out one-off spurious spikes (see its comment).
         int best = 0;
         for (int i = 1; i < SOUND_CLASS_COUNT; ++i) {
             if (scores[i] > scores[best]) best = i;
         }
-        if (scores[best] >= MIN_CONFIDENCE) {
-            const char* sound = SOUND_CLASS_NAMES[best];
-            if (std::strcmp(sound, "noise") != 0) {
-                ble_send_sound(sound);
+        static int consecutive_class = -1;
+        static int consecutive_count = 0;
+        if (scores[best] >= MIN_CONFIDENCE && std::strcmp(SOUND_CLASS_NAMES[best], "noise") != 0) {
+            consecutive_count = (best == consecutive_class) ? consecutive_count + 1 : 1;
+            consecutive_class = best;
+            if (consecutive_count >= CONSECUTIVE_REQUIRED) {
+                ble_send_sound(SOUND_CLASS_NAMES[best]);
             }
+        } else {
+            consecutive_class = -1;
+            consecutive_count = 0;
         }
     }
 }
