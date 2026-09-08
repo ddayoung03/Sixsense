@@ -10,13 +10,9 @@
 
 #include "driver/i2s_std.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
-#include "driver/rtc_io.h"
-#include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -116,27 +112,6 @@ constexpr int I2S_PIN_SD  = 5;   // Geekble D2
 constexpr float MIC_GAIN = 1.0f;
 
 // -----------------------------------------------------------------------------
-// Deep sleep + battery monitoring (ported from the 2026-09-02 reference build).
-//   GPIO12 (A5): tact switch. Short click -> deep sleep; also wakes from it
-//                (ext0, active-LOW). Pressing it tells the TDOA board to sleep
-//                too via a "SLEEP\n" line on the angle UART.
-//   GPIO48     : Geekble Nano S3 built-in LED. ON = awake, OFF = sleeping.
-//   GPIO13 (A6): battery voltage through a 10k+10k divider -> ADC2_CH2.
-// The "fake charge" timer estimates % while charging (no fuel gauge IC): it
-// freezes the reading on plug-in, then ticks +1% every BATTERY_CAPACITY_MAH*36 ms.
-// -----------------------------------------------------------------------------
-constexpr gpio_num_t BUTTON_PIN = GPIO_NUM_12;
-constexpr gpio_num_t LED_PIN = GPIO_NUM_48;
-constexpr uint32_t BATTERY_CAPACITY_MAH = 2000UL;   // set to your pack's mAh
-constexpr adc_channel_t BATT_ADC_CHANNEL = ADC_CHANNEL_2;  // GPIO13 (A6) = ADC2_CH2
-constexpr int BATT_SAMPLE_COUNT = 100;
-constexpr float BATT_COMPLETE_V = 4.15f;           // treat >= this as 100% while charging
-constexpr uint32_t BATT_CHECK_INTERVAL_MS = 2000;
-constexpr uint32_t BATT_STABILIZE_DELAY_MS = 500;
-constexpr uint32_t BATT_DISCHARGE_DELAY_MS = 1000;
-const uint32_t FAKE_CHARGE_INTERVAL = BATTERY_CAPACITY_MAH * 36UL;  // ms per +1%
-
-// -----------------------------------------------------------------------------
 // v3.2 runtime RMS normalization: MUST match training model_info.json.
 // -----------------------------------------------------------------------------
 constexpr float RMS_GATE_PCM16 = 120.0f;  // lowered from 150 (model_info.json still says 150) to catch quieter sounds
@@ -207,17 +182,6 @@ float fft_imag[FFT_SIZE];
 float power_spectrum[FFT_BINS];
 
 i2s_chan_handle_t rx_handle = nullptr;
-
-// Battery monitoring state.
-static adc_oneshot_unit_handle_t adc_handle = nullptr;
-static float min_recent_voltage = 99.0f;
-static float max_recent_voltage = 0.0f;
-static bool is_charging = false;
-static int current_battery_pct = 0;
-static int frozen_battery_pct = 0;      // % frozen at charge-plug-in
-static uint32_t last_internal_batt_check = 0;
-static uint32_t last_fake_charge_time = 0;
-
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input_tensor = nullptr;
@@ -450,30 +414,6 @@ static bool ble_send_sound(const char* sound_name) {
     return true;
 }
 
-// Notify-only battery status on the same characteristic. Payload "BATT,<pct>,
-// <CHARGING|DISCHARGING>" - 3 comma fields, so the watch's 2-field alert parser
-// ignores it unless it explicitly handles the BATT prefix. Does not touch
-// ble_last_payload (that stays the last alert, for GATT reads).
-static void ble_send_battery(int pct, bool charging) {
-    char payload[32];
-    std::snprintf(payload, sizeof(payload), "BATT,%d,%s",
-                  pct, charging ? "CHARGING" : "DISCHARGING");
-
-    if (ble_conn_handle == BLE_HS_CONN_HANDLE_NONE || !ble_notify_enabled) return;
-
-    os_mbuf* om = ble_hs_mbuf_from_flat(payload, std::strlen(payload));
-    if (!om) {
-        ESP_LOGE(TAG, "BLE battery notify buffer allocation failed");
-        return;
-    }
-    const int rc = ble_gatts_notify_custom(ble_conn_handle, ble_char_val_handle, om);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "BLE battery notify failed: rc=%d", rc);
-        return;
-    }
-    ESP_LOGI(TAG, "BLE TX -> %s", payload);
-}
-
 // -----------------------------------------------------------------------------
 // UART angle receiver
 // Same behavior as tinyml_BLE.ino:
@@ -616,180 +556,6 @@ static bool init_angle_uart() {
              static_cast<int>(ANGLE_UART_PORT), ANGLE_UART_BAUD,
              ANGLE_UART_RX_PIN, ANGLE_UART_TX_PIN, DEFAULT_ANGLE_DEG);
     return true;
-}
-
-// -----------------------------------------------------------------------------
-// Battery ADC + deep sleep (ported from the 2026-09-02 reference build)
-// -----------------------------------------------------------------------------
-static bool init_battery_adc() {
-    adc_oneshot_unit_init_cfg_t unit_cfg = {};
-    unit_cfg.unit_id = ADC_UNIT_2;
-    unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
-    if (adc_oneshot_new_unit(&unit_cfg, &adc_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Battery ADC unit init failed");
-        return false;
-    }
-    adc_oneshot_chan_cfg_t chan_cfg = {};
-    chan_cfg.atten = ADC_ATTEN_DB_12;
-    chan_cfg.bitwidth = ADC_BITWIDTH_12;
-    if (adc_oneshot_config_channel(adc_handle, BATT_ADC_CHANNEL, &chan_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Battery ADC channel config failed");
-        return false;
-    }
-    ESP_LOGI(TAG, "Battery ADC ready: GPIO13 (A6, ADC2_CH2)");
-    return true;
-}
-
-// Averaged battery voltage. 10k+10k divider -> multiply the pin voltage by 2.
-static float get_battery_voltage() {
-    long raw_sum = 0;
-    for (int i = 0; i < BATT_SAMPLE_COUNT; ++i) {
-        int raw = 0;
-        if (adc_oneshot_read(adc_handle, BATT_ADC_CHANNEL, &raw) != ESP_OK) return 0.0f;
-        raw_sum += raw;
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    const float smoothed = raw_sum / static_cast<float>(BATT_SAMPLE_COUNT);
-    return (smoothed / 4095.0f) * 3.3f * 2.0f;
-}
-
-// Li-ion discharge curve -> percent.
-static int battery_pct_from_voltage(float v) {
-    if (v >= 4.15f) return 100;
-    if (v >= 3.95f) return 75 + static_cast<int>(((v - 3.95f) / 0.20f) * 25.0f);
-    if (v >= 3.70f) return 40 + static_cast<int>(((v - 3.70f) / 0.25f) * 35.0f);
-    if (v >= 3.50f) return 10 + static_cast<int>(((v - 3.50f) / 0.20f) * 30.0f);
-    if (v >= 3.30f) return static_cast<int>(((v - 3.30f) / 0.20f) * 10.0f);
-    return 0;
-}
-
-// Detects plug-in/out from a >=0.06 V swing off the recent min/max. While
-// charging (no fuel gauge), the reading is frozen and ticked +1% on a timer.
-// Sends a BLE notify only on a state change or a tick.
-static void update_battery_status() {
-    float v = get_battery_voltage();
-    bool state_changed = false;
-
-    if (min_recent_voltage > 10.0f) {          // first call: seed the trackers
-        min_recent_voltage = v;
-        max_recent_voltage = v;
-    }
-
-    if (!is_charging) {
-        if (v < min_recent_voltage) min_recent_voltage = v;
-        if (v - min_recent_voltage > 0.06f) {
-            vTaskDelay(pdMS_TO_TICKS(BATT_STABILIZE_DELAY_MS));
-            v = get_battery_voltage();
-            is_charging = true;
-            max_recent_voltage = v;
-            state_changed = true;
-            frozen_battery_pct = battery_pct_from_voltage(v);
-            current_battery_pct = frozen_battery_pct;
-            last_fake_charge_time = xTaskGetTickCount() / portTICK_PERIOD_MS;
-            ESP_LOGI(TAG, "Charging detected: frozen at %d%%, +1%% every %lu ms",
-                     frozen_battery_pct, (unsigned long)FAKE_CHARGE_INTERVAL);
-        }
-    } else {
-        if (v > max_recent_voltage) max_recent_voltage = v;
-        if (max_recent_voltage - v > 0.06f) {
-            vTaskDelay(pdMS_TO_TICKS(BATT_DISCHARGE_DELAY_MS));
-            v = get_battery_voltage();
-            is_charging = false;
-            min_recent_voltage = v;
-            state_changed = true;
-            ESP_LOGI(TAG, "Charger removed: back to live voltage reading");
-        }
-    }
-
-    bool pct_ticked = false;
-    if (is_charging) {
-        if (v >= BATT_COMPLETE_V) {
-            if (current_battery_pct != 100) { current_battery_pct = 100; pct_ticked = true; }
-        } else {
-            const uint32_t now = xTaskGetTickCount() / portTICK_PERIOD_MS;
-            if (now - last_fake_charge_time >= FAKE_CHARGE_INTERVAL) {
-                if (current_battery_pct < 100) ++current_battery_pct;
-                last_fake_charge_time = now;
-                pct_ticked = true;
-            }
-        }
-    } else {
-        current_battery_pct = battery_pct_from_voltage(v);
-    }
-
-    ESP_LOGI(TAG, "Battery: %.2fV (%d%%) [%s]",
-             v, current_battery_pct, is_charging ? "CHARGING" : "DISCHARGING");
-
-    if (state_changed || (pct_ticked && is_charging)) {
-        ble_send_battery(current_battery_pct, is_charging);
-    }
-}
-
-static void init_led() {
-    gpio_config_t led_cfg = {};
-    led_cfg.pin_bit_mask = (1ULL << LED_PIN);
-    led_cfg.mode = GPIO_MODE_OUTPUT;
-    led_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
-    led_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    led_cfg.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&led_cfg);
-    gpio_set_level(LED_PIN, 1);                 // ON = awake
-    ESP_LOGI(TAG, "LED ready: GPIO%d (ON)", static_cast<int>(LED_PIN));
-}
-
-// Polls the tact switch. A short click (50-500 ms) enters deep sleep after
-// telling the TDOA board to do the same. Wakes on the same pin going LOW.
-static void button_task(void*) {
-    while (true) {
-        if (gpio_get_level(BUTTON_PIN) == 0) {
-            const uint32_t press = xTaskGetTickCount();
-            vTaskDelay(pdMS_TO_TICKS(50));                       // debounce
-            while (gpio_get_level(BUTTON_PIN) == 0) vTaskDelay(pdMS_TO_TICKS(10));
-            const uint32_t dur = (xTaskGetTickCount() - press) * portTICK_PERIOD_MS;
-
-            if (dur > 50 && dur < 500) {
-                ESP_LOGI(TAG, "Click (%ums) -> entering deep sleep", (unsigned)dur);
-                vTaskDelay(pdMS_TO_TICKS(100));                  // let the switch settle
-                gpio_set_level(LED_PIN, 0);
-
-                // Keep the wake pin pulled up through sleep so UART/line noise
-                // on a neighbouring pin can't spuriously wake the chip.
-                rtc_gpio_pullup_en(BUTTON_PIN);
-                rtc_gpio_pulldown_dis(BUTTON_PIN);
-
-                // Tell the TDOA board to sleep too, then tear the UART down so
-                // its idle level can't backfeed the sleeping TDOA board.
-                const char* cmd = "SLEEP\n";
-                uart_write_bytes(ANGLE_UART_PORT, cmd, std::strlen(cmd));
-                uart_wait_tx_done(ANGLE_UART_PORT, pdMS_TO_TICKS(100));
-                uart_driver_delete(ANGLE_UART_PORT);
-                gpio_reset_pin(static_cast<gpio_num_t>(ANGLE_UART_RX_PIN));
-                gpio_reset_pin(static_cast<gpio_num_t>(ANGLE_UART_TX_PIN));
-
-                esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);     // wake on LOW
-                esp_deep_sleep_start();
-            } else if (dur >= 500) {
-                ESP_LOGI(TAG, "Long press ignored (%ums)", (unsigned)dur);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
-
-static void init_button() {
-    gpio_config_t btn_cfg = {};
-    btn_cfg.pin_bit_mask = (1ULL << BUTTON_PIN);
-    btn_cfg.mode = GPIO_MODE_INPUT;
-    btn_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
-    btn_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    btn_cfg.intr_type = GPIO_INTR_DISABLE;
-    if (gpio_config(&btn_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Button GPIO config failed");
-        return;
-    }
-    xTaskCreate(button_task, "btn_task", 3072, nullptr, 10, nullptr);
-    ESP_LOGI(TAG, "Button ready: GPIO%d (A5), sleep on short click",
-             static_cast<int>(BUTTON_PIN));
 }
 
 struct RmsNormStats {
@@ -1285,11 +1051,6 @@ extern "C" void app_main(void) {
     if (!init_ble()) stop_forever("BLE initialization failed");
     if (!init_angle_uart()) stop_forever("Angle UART initialization failed");
     if (!init_microphone()) stop_forever("INMP441 initialization failed");
-    if (!init_battery_adc()) stop_forever("Battery ADC initialization failed");
-
-    init_led();                 // LED on = awake
-    init_button();              // starts button_task (short click -> deep sleep)
-    update_battery_status();    // one reading at boot
 
     ESP_LOGI(TAG, "Filling initial 2-second window...");
     for (;;) {
@@ -1314,12 +1075,6 @@ extern "C" void app_main(void) {
         // blocking a fresh 2s window every time -> the rolling window slides
         // forward and worst-case reaction latency drops to roughly one hop
         // instead of up to ~4s.
-        const uint32_t now_ms = xTaskGetTickCount() / portTICK_PERIOD_MS;
-        if (now_ms - last_internal_batt_check > BATT_CHECK_INTERVAL_MS) {
-            update_battery_status();
-            last_internal_batt_check = now_ms;
-        }
-
         int16_t minimum = INT16_MAX, maximum = INT16_MIN;
         if (!capture_chunk_into_ring(HOP_SAMPLES, minimum, maximum)) {
             vTaskDelay(pdMS_TO_TICKS(500));
