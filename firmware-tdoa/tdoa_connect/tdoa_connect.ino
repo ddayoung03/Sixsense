@@ -2,7 +2,15 @@
 #include <math.h>
 #include <string.h>
 #include "driver/i2s.h"
+#include "driver/rtc_io.h"
 #include "arduinoFFT.h"
+
+// ===== 딥슬립 핀 정의 =====
+// BUTTON_PIN (GPIO12 / A5): 택트 스위치. LOW로 깨어남(ext0).
+// LED_PIN    (GPIO48)     : 긱블 나노 S3 빌트인 LED. 켜짐=활성, 꺼짐=수면.
+// TinyML 보드가 각도 UART로 "SLEEP\n"을 보내면 이 보드도 같이 딥슬립한다.
+#define BUTTON_PIN 12
+#define LED_PIN    48
 
 // ===== 하드웨어 핀 정의 (I2S, 긱블 나노 기준) =====
 #define I2S0_WS   D2
@@ -61,6 +69,20 @@ float last_angle_deg = 0.0f;
 char rx_line[16] = {0};
 size_t rx_used = 0;
 
+// TinyML 보드와 딥슬립 동기화: "SLEEP" 수신 시 마이크/타이머 정리 후 딥슬립.
+// GPIO12를 다시 LOW로 만들면(버튼) 깨어나 setup()부터 재시작한다.
+void enter_deep_sleep() {
+  Serial.println("🌙 메인 보드 요청으로 딥슬립 진입");
+  digitalWrite(LED_PIN, LOW);
+  i2s_driver_uninstall(I2S_NUM_0);
+  i2s_driver_uninstall(I2S_NUM_1);
+  // 딥슬립 중 웨이크 핀 플로팅 방지 (UART 등 노이즈로 즉시 깨는 현상 차단)
+  rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);  // LOW에서 기상
+  esp_deep_sleep_start();
+}
+
 void check_angle_request() {
   while (Serial1.available()) {
     char c = (char)Serial1.read();
@@ -68,6 +90,8 @@ void check_angle_request() {
       rx_line[rx_used] = '\0';
       if (strncmp(rx_line, "GET_ANGLE", 9) == 0) {
         Serial1.println(last_angle_deg);
+      } else if (strcmp(rx_line, "SLEEP") == 0) {
+        enter_deep_sleep();
       }
       rx_used = 0;
       continue;
@@ -139,7 +163,11 @@ int compute_gcc_phat_delay(float* sig1, float* sig2) {
 void setup() {
   Serial.begin(115200); // 디버깅용 PC 연결
   Serial1.begin(115200, SERIAL_8N1, UART_RX, UART_TX); // 보드 간 통신용 설정
-  
+
+  // LED 켜기 = 활성 상태 표시. 딥슬립에서 깨면 여기부터 다시 시작된다.
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
   i2s_config_t i2s_cfg = {};
   i2s_cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   i2s_cfg.sample_rate = (uint32_t)FS;
