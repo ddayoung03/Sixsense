@@ -55,7 +55,6 @@ constexpr int64_t FAKE_CHARGE_INTERVAL_US = BATTERY_CAPACITY_MAH * 36000LL * 100
 static float previous_voltage = 0.0f;
 static bool is_charging = false;
 static int current_battery_pct = 0;
-static int64_t last_internal_batt_check = 0;
 static int64_t last_fake_charge_time = 0;
 
 // -----------------------------------------------------------------------------
@@ -465,6 +464,27 @@ static void ble_send_battery() {
     }
 }
 
+// Runs on its own task so getBatteryVoltage()'s 100-sample ADC loop (and the
+// extra 500-1000ms vTaskDelay updateBatteryStatus() adds on a charge/discharge
+// transition) never blocks the audio capture loop in app_main. Inline in that
+// loop, a single charge-state change could stall it well past the 128ms I2S
+// DMA buffer margin (the same margin HOP_SAMPLES was tuned around) and drop
+// audio right at that moment.
+static void battery_task(void*) {
+    while (true) {
+        bool old_charging_state = is_charging;
+        int old_pct = current_battery_pct;
+
+        updateBatteryStatus();
+
+        if (old_charging_state != is_charging || old_pct != current_battery_pct) {
+            ble_send_battery();
+            ESP_LOGI(TAG, "Battery status changed -> Notified watch");
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 static void init_power_management() {
     gpio_config_t led_conf = {};
     led_conf.pin_bit_mask = (1ULL << LED_BUILTIN_PIN);
@@ -480,32 +500,37 @@ static void init_power_management() {
 
     adc_oneshot_unit_init_cfg_t init_config = {};
     init_config.unit_id = ADC_UNIT_2; // A6(GPIO13) uses ADC2
-    adc_oneshot_new_unit(&init_config, &adc_handle);
+    esp_err_t err = adc_oneshot_new_unit(&init_config, &adc_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Battery ADC unit init failed: %s", esp_err_to_name(err));
+    }
     adc_oneshot_chan_cfg_t config = {};
     config.bitwidth = ADC_BITWIDTH_DEFAULT;
     config.atten = ADC_ATTEN_DB_12;
-    adc_oneshot_config_channel(adc_handle, BATT_ADC_CHAN, &config);
+    err = adc_oneshot_config_channel(adc_handle, BATT_ADC_CHAN, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Battery ADC channel config failed: %s", esp_err_to_name(err));
+    }
 
     updateBatteryStatus();
-    last_internal_batt_check = esp_timer_get_time();
     ESP_LOGI(TAG, "Power management initialized. Batt: %d%%", current_battery_pct);
+    xTaskCreate(battery_task, "battery_task", 4096, nullptr, 1, nullptr);
 }
 
 static bool ble_send_sound(const char* sound_name) {
     if (!sound_name) return false;
 
     // Ask the TDOA board for its angle right now, at classification time,
-    // instead of relying on a stale background UART cache.
+    // instead of relying on a stale background UART cache. 90 deg is a real,
+    // valid bearing (due east), so it can't double as a "no reading yet"
+    // sentinel - TDOA instead answers with -1 (out of the 0-360 range) until
+    // it has computed a real angle, which parse_angle_line()'s range check
+    // already rejects as invalid, making request_angle_sync() time out and
+    // fall into the branch below. No separate "is this the default" check
+    // needed here.
     float angle = 0.0f;
     if (!request_angle_sync(angle)) {
         ESP_LOGW(TAG, "GET_ANGLE request timed out. Skipping BLE notification.");
-        return false;
-    }
-
-    // Default angle (90.0) means the TDOA board never answered with a real
-    // reading either - skip rather than alert with a made-up direction.
-    if (angle == 90.0f) {
-        ESP_LOGW(TAG, "Received default angle (90.0). Skipping BLE notification.");
         return false;
     }
 
@@ -1221,19 +1246,8 @@ extern "C" void app_main(void) {
             }
         }
 
-        // Battery check every 2 seconds.
-        if (esp_timer_get_time() - last_internal_batt_check > 2000000LL) {
-            bool old_charging_state = is_charging;
-            int old_pct = current_battery_pct;
-
-            updateBatteryStatus();
-
-            if (old_charging_state != is_charging || old_pct != current_battery_pct) {
-                ble_send_battery();
-                ESP_LOGI(TAG, "Battery status changed -> Notified watch");
-            }
-            last_internal_batt_check = esp_timer_get_time();
-        }
+        // Battery is checked on its own task (battery_task) - see
+        // init_power_management() - so it can never stall audio capture here.
 
         float raw_rms = 0.0f;
         snapshot_window_and_rms(raw_rms);

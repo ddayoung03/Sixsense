@@ -77,7 +77,11 @@ int med_count = 0, med_idx = 0;
 // 최신으로 계산된 각도만 들고 있다가, 메인(TinyML) 보드가 GET_ANGLE을 요청할 때만 응답한다.
 // (예전 버전처럼 무조건 브로드캐스트하면 "판단 시점"과 무관한 각도가 붙어버림 -
 //  main.cpp의 request_angle_sync()가 기대하는 프로토콜이 바로 이 요청/응답 방식이다.)
-float last_angle_deg = 0.0f;
+// -1.0은 "아직 방향 계산 안 됨" 표시. 0.0으로 두면 진짜 유효한 방향(정북)과 구분이
+// 안 돼서 main.cpp가 "아직 모름"을 "정북에서 소리남"으로 착각하게 된다. 범위(0~360)
+// 밖의 -1.0은 main.cpp의 parse_angle_line() 범위 체크에서 자동으로 거부되어
+// GET_ANGLE 타임아웃과 동일하게 처리됨(별도 분기 불필요).
+float last_angle_deg = -1.0f;
 char rx_line[16] = {0};
 size_t rx_used = 0;
 
