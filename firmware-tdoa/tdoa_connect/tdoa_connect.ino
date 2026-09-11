@@ -2,7 +2,14 @@
 #include <math.h>
 #include <string.h>
 #include "driver/i2s.h"
+#include "driver/rtc_io.h"
 #include "arduinoFFT.h"
+
+// ===== 딥슬립 핀 정의 =====
+// BUTTON_PIN (GPIO12 / A5): 택트 스위치. LOW로 깨어남(ext0).
+// LED_PIN    (GPIO48)     : 긱블 나노 S3 빌트인 LED. 켜짐=활성, 꺼짐=수면.
+#define BUTTON_PIN 12
+#define LED_PIN    48
 
 // ===== 하드웨어 핀 정의 (I2S, 긱블 나노 기준) =====
 #define I2S0_WS   D2
@@ -18,11 +25,11 @@
 #define UART_RX   RX
 
 // ===== 오디오 및 TDOA 상수 =====
-#define FS                  16000.0f  
-#define SAMPLES_PER_READ    1024      
-#define DISTANCE_MICS_M     0.25f     
-#define SOUND_SPEED_MPS     343.0f    
-// 💡 만약 너무 작은 소리에도 반응해서 각도가 튄다면 이 값을 키우고(예: 1.0e-5f), 
+#define FS                  16000.0f
+#define SAMPLES_PER_READ    1024
+#define DISTANCE_MICS_M     0.25f
+#define SOUND_SPEED_MPS     343.0f
+// 💡 만약 너무 작은 소리에도 반응해서 각도가 튄다면 이 값을 키우고(예: 1.0e-5f),
 // 소리를 잘 못 잡으면 이 값을 줄여주세요(예: 1.0e-6f).
 #define ENERGY_THRESH       5.0e-6f
 // 메인 상관 피크가 (PSR_GUARD 샘플 이상 떨어진) 최대 부엽보다 이 배수 이상
@@ -67,11 +74,26 @@ bool ema_initialized = false;
 float dx_hist[MED_LEN] = {0}, dy_hist[MED_LEN] = {0};
 int med_count = 0, med_idx = 0;
 
-// 최신으로 계산된 각도만 들고 있다가, 2번 보드(TinyML)가 GET_ANGLE을 요청할 때만 응답한다.
-// (예전에는 무조건 브로드캐스트했는데, 그러면 "판단 시점"과 무관한 각도가 붙어버림)
+// 최신으로 계산된 각도만 들고 있다가, 메인(TinyML) 보드가 GET_ANGLE을 요청할 때만 응답한다.
+// (예전 버전처럼 무조건 브로드캐스트하면 "판단 시점"과 무관한 각도가 붙어버림 -
+//  main.cpp의 request_angle_sync()가 기대하는 프로토콜이 바로 이 요청/응답 방식이다.)
 float last_angle_deg = 0.0f;
 char rx_line[16] = {0};
 size_t rx_used = 0;
+
+// 메인 보드로부터 UART(Serial1)로 "SLEEP" 수신 시 딥슬립 진입.
+// GPIO12를 다시 LOW로 만들면(버튼) 깨어나 setup()부터 재시작한다.
+void enter_deep_sleep() {
+  Serial.println("🌙 딥슬립 진입");
+  digitalWrite(LED_PIN, LOW);
+  i2s_driver_uninstall(I2S_NUM_0);
+  i2s_driver_uninstall(I2S_NUM_1);
+  // 딥슬립 중 웨이크 핀 플로팅 방지 (UART 등 노이즈로 즉시 깨는 현상 차단)
+  rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);  // LOW에서 기상
+  esp_deep_sleep_start();
+}
 
 void check_angle_request() {
   while (Serial1.available()) {
@@ -80,6 +102,8 @@ void check_angle_request() {
       rx_line[rx_used] = '\0';
       if (strncmp(rx_line, "GET_ANGLE", 9) == 0) {
         Serial1.println(last_angle_deg);
+      } else if (strcmp(rx_line, "SLEEP") == 0) {
+        enter_deep_sleep();
       }
       rx_used = 0;
       continue;
@@ -186,6 +210,16 @@ void setup() {
   Serial.begin(115200); // 디버깅용 PC 연결
   Serial1.begin(115200, SERIAL_8N1, UART_RX, UART_TX); // 보드 간 통신용 설정
 
+  // LED 설정 및 켜기 (깨어있음을 표시)
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  // 버튼 핀 설정 + 웨이크업 시 누르고 있던 버튼에서 손을 뗄 때까지 대기
+  // (루프 진입 후 곧바로 다시 딥슬립에 빠지는 현상 방지)
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  while (digitalRead(BUTTON_PIN) == LOW) { delay(10); }
+  delay(50);
+
   i2s_config_t i2s_cfg = {};
   i2s_cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   i2s_cfg.sample_rate = (uint32_t)FS;
@@ -211,6 +245,17 @@ void setup() {
 }
 
 void loop() {
+  // 물리적 버튼으로도 직접 딥슬립 진입 (메인 보드의 UART "SLEEP" 명령과는 별개 경로)
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50); // 디바운스
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      Serial.println("🌙 물리적 버튼 입력으로 딥슬립에 진입합니다...");
+      while (digitalRead(BUTTON_PIN) == LOW) { delay(10); } // 버튼에서 손을 뗄 때까지 대기
+      delay(50);
+      enter_deep_sleep();
+    }
+  }
+
   check_angle_request();
 
   size_t bytes_read0 = 0, bytes_read1 = 0;
@@ -218,10 +263,10 @@ void loop() {
   i2s_read(I2S_NUM_1, raw_buf_i2s1, sizeof(raw_buf_i2s1), &bytes_read1, portMAX_DELAY);
 
   for (int i = 0; i < SAMPLES_PER_READ; ++i) {
-    buf_E[i] = (float)(raw_buf_i2s0[2 * i + 0] >> 8) / 8388608.0f; 
-    buf_W[i] = (float)(raw_buf_i2s0[2 * i + 1] >> 8) / 8388608.0f; 
-    buf_N[i] = (float)(raw_buf_i2s1[2 * i + 0] >> 8) / 8388608.0f; 
-    buf_S[i] = (float)(raw_buf_i2s1[2 * i + 1] >> 8) / 8388608.0f; 
+    buf_E[i] = (float)(raw_buf_i2s0[2 * i + 0] >> 8) / 8388608.0f;
+    buf_W[i] = (float)(raw_buf_i2s0[2 * i + 1] >> 8) / 8388608.0f;
+    buf_N[i] = (float)(raw_buf_i2s1[2 * i + 0] >> 8) / 8388608.0f;
+    buf_S[i] = (float)(raw_buf_i2s1[2 * i + 1] >> 8) / 8388608.0f;
   }
 
   float eE = calculate_energy(buf_E, SAMPLES_PER_READ);
@@ -262,7 +307,7 @@ void loop() {
   angle_deg = fmodf(angle_deg, 360.0f);
   if (angle_deg < 0.0f) angle_deg += 360.0f;
 
-  // 무조건 전송하지 않고 최신 각도만 보관 -> 2번 보드가 GET_ANGLE로 요청할 때 응답
+  // 무조건 전송하지 않고 최신 각도만 보관 -> 메인 보드가 GET_ANGLE로 요청할 때 응답
   last_angle_deg = angle_deg;
 
   // 시리얼 모니터 확인용 출력
