@@ -189,7 +189,16 @@ constexpr bool ENABLE_FEATURE_DEBUG = true;
 constexpr bool ENABLE_OUTPUT_DEBUG = true;
 
 uint8_t* tensor_arena = nullptr;
-int16_t* audio_pcm = nullptr;   // linear snapshot of the latest 2s window (chronological order)
+// Double-buffered snapshot of the latest 2s window (chronological order).
+// capture_task (core0) writes a fresh snapshot into whichever half infer_task
+// isn't currently reading, then points `audio_pcm` at it before waking
+// infer_task (core1) - ping-pong instead of a lock, since infer_task's ~508ms
+// of work comfortably finishes within the ~1s it takes capture_task to cycle
+// back to the same half (2 hops later).
+int16_t* audio_pcm_bufs[2] = {nullptr, nullptr};
+int16_t* audio_pcm = nullptr;   // "current" buffer for this inference cycle - set by infer_task
+float raw_rms_bufs[2] = {0.0f, 0.0f};
+TaskHandle_t infer_task_handle = nullptr;
 int16_t* ring_pcm = nullptr;    // continuously-filled circular capture buffer, size SAMPLE_COUNT
 uint32_t ring_write_pos = 0;
 float* log_mel_buffer = nullptr;
@@ -775,14 +784,16 @@ bool allocate_buffers() {
         }
     }
 
-    audio_pcm = static_cast<int16_t*>(
-        alloc_prefer_psram(SAMPLE_COUNT * sizeof(int16_t), "PCM buffer"));
+    audio_pcm_bufs[0] = static_cast<int16_t*>(
+        alloc_prefer_psram(SAMPLE_COUNT * sizeof(int16_t), "PCM buffer 0"));
+    audio_pcm_bufs[1] = static_cast<int16_t*>(
+        alloc_prefer_psram(SAMPLE_COUNT * sizeof(int16_t), "PCM buffer 1"));
     ring_pcm = static_cast<int16_t*>(
         alloc_prefer_psram(SAMPLE_COUNT * sizeof(int16_t), "Ring PCM buffer"));
     log_mel_buffer = static_cast<float*>(
         alloc_prefer_psram(FEATURE_COUNT * sizeof(float), "Log-Mel buffer"));
 
-    if (!tensor_arena || !audio_pcm || !ring_pcm || !log_mel_buffer) {
+    if (!tensor_arena || !audio_pcm_bufs[0] || !audio_pcm_bufs[1] || !ring_pcm || !log_mel_buffer) {
         ESP_LOGE(TAG, "Buffer allocation failed. Check QSPI PSRAM settings.");
         return false;
     }
@@ -992,20 +1003,23 @@ bool capture_chunk_into_ring(uint32_t n_samples, int16_t& minimum, int16_t& maxi
 }
 
 // Unwraps the most recent SAMPLE_COUNT samples from the ring buffer into
-// `audio_pcm` in chronological order (oldest -> newest) and computes their
-// RMS. Downstream code (normalization, Log-Mel) is unchanged: it just reads
-// audio_pcm[] linearly like before.
-void snapshot_window_and_rms(float& rms_out) {
+// `dst` in chronological order (oldest -> newest) and computes their RMS.
+// Called from capture_task (core0) only - ring_pcm/ring_write_pos are never
+// touched by infer_task, so this needs no locking. `dst` is one half of
+// audio_pcm_bufs (see its comment); downstream code (normalization, Log-Mel)
+// is unchanged - it just reads through the `audio_pcm` pointer, which
+// infer_task points at this same `dst` before processing it.
+void snapshot_window_and_rms(int16_t* dst, float& rms_out) {
     for (uint32_t i = 0; i < SAMPLE_COUNT; ++i) {
-        audio_pcm[i] = ring_pcm[(ring_write_pos + i) % SAMPLE_COUNT];
+        dst[i] = ring_pcm[(ring_write_pos + i) % SAMPLE_COUNT];
     }
 
     int64_t sum = 0;
-    for (uint32_t i = 0; i < SAMPLE_COUNT; ++i) sum += audio_pcm[i];
+    for (uint32_t i = 0; i < SAMPLE_COUNT; ++i) sum += dst[i];
     const double mean = static_cast<double>(sum) / static_cast<double>(SAMPLE_COUNT);
     double squares = 0.0;
     for (uint32_t i = 0; i < SAMPLE_COUNT; ++i) {
-        const double centered = static_cast<double>(audio_pcm[i]) - mean;
+        const double centered = static_cast<double>(dst[i]) - mean;
         squares += centered * centered;
     }
     rms_out = static_cast<float>(std::sqrt(squares / static_cast<double>(SAMPLE_COUNT)));
@@ -1183,74 +1197,19 @@ void print_prediction(const float scores[SOUND_CLASS_COUNT], const RmsNormStats&
     while (true) vTaskDelay(pdMS_TO_TICKS(2000));
 }
 
-}  // namespace
-
-extern "C" void app_main(void) {
-    std::printf("\n\n=======================================================\n");
-    std::printf("Geekble ESP32-S3 Sound Classifier v3.2 RMS - ESP-IDF\n");
-    std::printf("Model: horn / noise / siren | INT8 | Log-Mel 64x126x1\n");
-    std::printf("Pipeline: RMS gate 150 -> normalize 2500 -> Log-Mel -> TFLite\n");
-    std::printf("=======================================================\n");
-
-    if (!allocate_buffers()) stop_forever("Memory allocation failed");
-    if (!init_model()) stop_forever("TFLite v3.2 model initialization failed");
-    if (!init_ble()) stop_forever("BLE initialization failed");
-    if (!init_angle_uart()) stop_forever("Angle UART initialization failed");
-    if (!init_microphone()) stop_forever("INMP441 initialization failed");
-    init_power_management();
-
-    ESP_LOGI(TAG, "Filling initial 2-second window...");
+// ===== Task B (core1): normalize + Log-Mel + inference + alert =====
+// app_main (Task A, core0) hands off a ready buffer index via task
+// notification after each hop and immediately goes back to capturing the
+// next one - this task's ~508ms of work (preprocess+inference) can take as
+// long as it needs without delaying the mic capture loop, which is what
+// happened when both ran sequentially in app_main's own loop.
+void infer_task(void*) {
     for (;;) {
-        int16_t init_min = INT16_MAX, init_max = INT16_MIN;
-        if (!capture_chunk_into_ring(SAMPLE_COUNT, init_min, init_max)) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        if (init_min >= -1 && init_max <= 0) {
-            ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        break;
-    }
-    ESP_LOGI(TAG, "Ready. Sliding %.1fs window, %.2fs hop...",
-             static_cast<double>(WINDOW_SECONDS),
-             static_cast<double>(HOP_SAMPLES) / SAMPLE_RATE);
+        uint32_t buf_idx = 0;
+        xTaskNotifyWait(0, 0, &buf_idx, portMAX_DELAY);
 
-    while (true) {
-        // Only top up HOP_SAMPLES of *new* audio each cycle instead of
-        // blocking a fresh 2s window every time -> the rolling window slides
-        // forward and worst-case reaction latency drops to roughly one hop
-        // instead of up to ~4s.
-        int16_t minimum = INT16_MAX, maximum = INT16_MIN;
-        if (!capture_chunk_into_ring(HOP_SAMPLES, minimum, maximum)) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        if (minimum >= -1 && maximum <= 0) {
-            ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-
-        // Deep sleep: short click on the button.
-        if (gpio_get_level(BUTTON_PIN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            if (gpio_get_level(BUTTON_PIN) == 0) {
-                ESP_LOGI(TAG, "Deep sleep button pressed. Going to sleep.");
-                gpio_set_level(LED_BUILTIN_PIN, 0); // LOW for sleep (Active-High)
-                while (gpio_get_level(BUTTON_PIN) == 0) { vTaskDelay(pdMS_TO_TICKS(10)); }
-                vTaskDelay(pdMS_TO_TICKS(50));
-                esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
-                esp_deep_sleep_start();
-            }
-        }
-
-        // Battery is checked on its own task (battery_task) - see
-        // init_power_management() - so it can never stall audio capture here.
-
-        float raw_rms = 0.0f;
-        snapshot_window_and_rms(raw_rms);
+        audio_pcm = audio_pcm_bufs[buf_idx];
+        const float raw_rms = raw_rms_bufs[buf_idx];
 
         // Step 1: noise gate BEFORE normalization, exactly as runtime spec.
         if (raw_rms < RMS_GATE_PCM16) {
@@ -1310,5 +1269,91 @@ extern "C" void app_main(void) {
             consecutive_class = -1;
             consecutive_count = 0;
         }
+    }
+}
+
+}  // namespace
+
+// ===== Task A (core0, this task): I2S capture only =====
+// Never runs normalization/Log-Mel/inference/BLE itself - just keeps the
+// ring buffer fed and hands each hop's snapshot to infer_task (core1) via
+// task notification, then immediately goes back to reading the mic.
+extern "C" void app_main(void) {
+    std::printf("\n\n=======================================================\n");
+    std::printf("Geekble ESP32-S3 Sound Classifier v3.2 RMS - ESP-IDF\n");
+    std::printf("Model: horn / noise / siren | INT8 | Log-Mel 64x126x1\n");
+    std::printf("Pipeline: RMS gate 150 -> normalize 2500 -> Log-Mel -> TFLite\n");
+    std::printf("=======================================================\n");
+
+    if (!allocate_buffers()) stop_forever("Memory allocation failed");
+    if (!init_model()) stop_forever("TFLite v3.2 model initialization failed");
+    if (!init_ble()) stop_forever("BLE initialization failed");
+    if (!init_angle_uart()) stop_forever("Angle UART initialization failed");
+    if (!init_microphone()) stop_forever("INMP441 initialization failed");
+    init_power_management();
+
+    // app_main itself is pinned to core0 (CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0).
+    // Pin infer_task to core1 so capture and inference truly run in parallel
+    // instead of taking turns on one core.
+    xTaskCreatePinnedToCore(infer_task, "infer_task", 8192, nullptr, 5,
+                            &infer_task_handle, 1);
+
+    ESP_LOGI(TAG, "Filling initial 2-second window...");
+    for (;;) {
+        int16_t init_min = INT16_MAX, init_max = INT16_MIN;
+        if (!capture_chunk_into_ring(SAMPLE_COUNT, init_min, init_max)) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (init_min >= -1 && init_max <= 0) {
+            ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        break;
+    }
+    ESP_LOGI(TAG, "Ready. Sliding %.1fs window, %.2fs hop (capture=core0, infer=core1)...",
+             static_cast<double>(WINDOW_SECONDS),
+             static_cast<double>(HOP_SAMPLES) / SAMPLE_RATE);
+
+    int next_buf = 0;
+    while (true) {
+        // Only top up HOP_SAMPLES of *new* audio each cycle instead of
+        // blocking a fresh 2s window every time -> the rolling window slides
+        // forward and worst-case reaction latency drops to roughly one hop
+        // instead of up to ~4s.
+        int16_t minimum = INT16_MAX, maximum = INT16_MIN;
+        if (!capture_chunk_into_ring(HOP_SAMPLES, minimum, maximum)) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (minimum >= -1 && maximum <= 0) {
+            ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // Deep sleep: short click on the button.
+        if (gpio_get_level(BUTTON_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (gpio_get_level(BUTTON_PIN) == 0) {
+                ESP_LOGI(TAG, "Deep sleep button pressed. Going to sleep.");
+                gpio_set_level(LED_BUILTIN_PIN, 0); // LOW for sleep (Active-High)
+                while (gpio_get_level(BUTTON_PIN) == 0) { vTaskDelay(pdMS_TO_TICKS(10)); }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
+                esp_deep_sleep_start();
+            }
+        }
+
+        // Battery is checked on its own task (battery_task) - see
+        // init_power_management() - so it can never stall audio capture here.
+
+        // Snapshot into whichever half infer_task isn't using, then hand it
+        // off. Ping-pongs every hop; infer_task's ~508ms of work comfortably
+        // finishes within the ~1s before this same half is reused again.
+        snapshot_window_and_rms(audio_pcm_bufs[next_buf], raw_rms_bufs[next_buf]);
+        xTaskNotify(infer_task_handle, static_cast<uint32_t>(next_buf), eSetValueWithOverwrite);
+        next_buf ^= 1;
     }
 }
