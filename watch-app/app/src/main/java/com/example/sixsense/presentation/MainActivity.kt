@@ -1,11 +1,13 @@
-package com.example.soundcompass.presentation
+package com.example.sixsense.presentation
 
 import android.Manifest
+import com.example.sixsense.presentation.theme.SixSenseTheme
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
-import android.content.SharedPreferences
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -17,9 +19,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.tween
+import androidx.core.content.edit
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,10 +33,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.BatteryChargingFull
+import androidx.compose.material.icons.filled.Battery1Bar
+import androidx.compose.material.icons.filled.Battery2Bar
+import androidx.compose.material.icons.filled.Battery3Bar
+import androidx.compose.material.icons.filled.Battery4Bar
+import androidx.compose.material.icons.filled.Battery5Bar
+import androidx.compose.material.icons.filled.Battery6Bar
+import androidx.compose.material.icons.filled.Battery0Bar
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,9 +65,17 @@ import androidx.wear.compose.material3.Text
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.time.Duration.Companion.milliseconds
 
 val SERVICE_UUID: UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
 val CHAR_UUID: UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
+
+private val VIBRATE_PATTERNS = arrayOf(
+    longArrayOf(0, 40),
+    longArrayOf(0, 80, 80, 80),
+    longArrayOf(0, 150, 80, 150),
+    longArrayOf(0, 100, 40, 100, 40, 100)
+)
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
@@ -67,15 +85,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
     private var rotationSensor: Sensor? = null
-    private val currentAzimuth = mutableStateOf(0f)
+    private val currentAzimuth = mutableFloatStateOf(0f)
     private var initialAzimuth = 0f
 
+    // 센서 연산을 위한 배열 재사용
+    private val rotationMatrix = FloatArray(9)
+    private val orientationAngles = FloatArray(3)
+
     private val isConnected = mutableStateOf(false)
-    private val isConnecting = mutableStateOf(false)
     private val isScanning = mutableStateOf(false)
-    private var userInitiatedDisconnect = false
-    private var reconnectAttempts = 0
-    private val maxReconnectAttempts = 3
 
     private val scannedDevicesMap = mutableStateMapOf<String, BluetoothDevice>()
     private val deviceTimestamps = mutableMapOf<String, Long>()
@@ -83,42 +101,49 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val isAlertActive = mutableStateOf(false)
     private val alertSoundType = mutableStateOf("")
-    private val alertAngle = mutableStateOf(0f)
+    private val alertAngle = mutableFloatStateOf(0f)
+
+    private val esp32BatteryLevel = mutableIntStateOf(-1)
+    private val isEsp32Charging = mutableStateOf(false)
 
     private val isSettingsOpen = mutableStateOf(false)
     private val clockColor = mutableStateOf(Color(0xFF76FF03))
     private val alertColor = mutableStateOf(Color(0xFFFF1744))
-    private val vibeStrength = mutableStateOf(1)
+    private val vibeStrength = mutableIntStateOf(1)
 
-    private lateinit var settingsPrefs: SharedPreferences
-
-    private var savedDeviceAddress: String?
-        get() = settingsPrefs.getString("last_device_address", null)
-        set(value) { settingsPrefs.edit().putString("last_device_address", value).apply() }
-
-    private var savedDeviceName: String?
-        get() = settingsPrefs.getString("last_device_name", null)
-        set(value) { settingsPrefs.edit().putString("last_device_name", value).apply() }
+    private val prefs by lazy { getSharedPreferences("SixSensePrefs", MODE_PRIVATE) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        settingsPrefs = getSharedPreferences("sixsense_settings", Context.MODE_PRIVATE)
-        clockColor.value = Color(settingsPrefs.getInt("clock_color", clockColor.value.toArgb()))
-        alertColor.value = Color(settingsPrefs.getInt("alert_color", alertColor.value.toArgb()))
-        vibeStrength.value = settingsPrefs.getInt("vibe_strength", vibeStrength.value)
+        // 설정 로드
+        clockColor.value = Color(prefs.getInt("clockColor", Color(0xFF76FF03).toArgb()))
+        alertColor.value = Color(prefs.getInt("alertColor", Color(0xFFFF1744).toArgb()))
+        vibeStrength.intValue = prefs.getInt("vibeStrength", 1)
 
         setShowWhenLocked(true)
         setTurnScreenOn(true)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        @Suppress("DEPRECATION")
         wakeLock = powerManager.newWakeLock(
             PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
-            "SoundCompass::AlertWakeLock"
+            "SixSense::AlertWakeLock"
         )
 
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        val bluetoothAdapter = bluetoothManager.adapter
+
+        val enableBtLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            if (result.resultCode == RESULT_OK) {
+                startBleScan()
+            }
+        }
+
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
 
         val permissionLauncher = registerForActivityResult(
@@ -127,87 +152,125 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (!permissions.entries.all { it.value }) {
                 Log.e("BLE", "권한 거부됨")
             } else {
-                tryAutoReconnect()
+                // 권한 허용 후 자동 재연결 시도
+                checkAutoReconnect()
             }
         }
 
         setContent {
-            LaunchedEffect(Unit) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    permissionLauncher.launch(arrayOf(
-                        Manifest.permission.BLUETOOTH_SCAN,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                        Manifest.permission.ACCESS_FINE_LOCATION,
-                        Manifest.permission.WAKE_LOCK
-                    ))
+            SixSenseTheme {
+                LaunchedEffect(Unit) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        permissionLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.BLUETOOTH_SCAN,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.WAKE_LOCK
+                            )
+                        )
+                    } else {
+                        permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+                    }
+                }
+
+                LaunchedEffect(isScanning.value) {
+                    while (isScanning.value) {
+                        delay(500.milliseconds)
+                        val now = System.currentTimeMillis()
+                        val disconnectedDevices =
+                            deviceTimestamps.filter { now - it.value > 1000 }.keys
+                        disconnectedDevices.forEach { key ->
+                            deviceTimestamps.remove(key)
+                            scannedDevicesMap.remove(key)
+                        }
+                    }
+                }
+
+                LaunchedEffect(isAlertActive.value, alertSoundType.value, alertAngle.floatValue) {
+                    if (isAlertActive.value) {
+                        delay(5000.milliseconds)
+                        isAlertActive.value = false
+                    }
+                }
+
+                LaunchedEffect(isConnected.value) {
+                    if (isConnected.value) {
+                        requestBatteryUpdate() // 연결되자마자 즉시 한번 요청
+                        while (isConnected.value) {
+                            delay(60000.milliseconds) // 이후 1분마다
+                            requestBatteryUpdate()
+                        }
+                    }
+                }
+
+                if (isConnected.value) {
+                    val rotationOffset = currentAzimuth.floatValue - initialAzimuth
+                    val compensatedAngle = alertAngle.floatValue - rotationOffset
+
+                    MainScreen(
+                        isAlertActive = isAlertActive.value,
+                        soundType = alertSoundType.value,
+                        angle = compensatedAngle,
+                        isSettingsOpen = isSettingsOpen.value,
+                        connectedDeviceName = connectedDeviceName.value,
+                        clockColor = clockColor.value,
+                        alertColor = alertColor.value,
+                        vibeStrength = vibeStrength.intValue,
+                        esp32BatteryLevel = esp32BatteryLevel.intValue,
+                        isEsp32Charging = isEsp32Charging.value,
+                        onOpenSettings = { isSettingsOpen.value = true },
+                        onCloseSettings = { isSettingsOpen.value = false },
+                        onDisconnect = { disconnectFromDevice() },
+                        onClockColorChange = {
+                            clockColor.value = it
+                            prefs.edit { putInt("clockColor", it.toArgb()) }
+                        },
+                        onAlertColorChange = {
+                            alertColor.value = it
+                            prefs.edit { putInt("alertColor", it.toArgb()) }
+                        },
+                        onVibeChange = {
+                            vibeStrength.intValue = it
+                            prefs.edit { putInt("vibeStrength", it) }
+                            triggerHapticFeedback(this@MainActivity, it)
+                        }
+                    )
                 } else {
-                    permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+                    ConnectScreen(
+                        isScanning = isScanning.value,
+                        devices = scannedDevicesMap.values.toList(),
+                        onStartScan = {
+                            if (bluetoothAdapter?.isEnabled == false) {
+                                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                            } else {
+                                startBleScan()
+                            }
+                        },
+                        onDeviceClick = { device -> connectToDevice(device) }
+                    )
                 }
             }
+        }
+    }
 
-            LaunchedEffect(isScanning.value) {
-                while (isScanning.value) {
-                    delay(500)
-                    val now = System.currentTimeMillis()
-                    val disconnectedDevices = deviceTimestamps.filter { now - it.value > 1000 }.keys
-                    disconnectedDevices.forEach { key ->
-                        deviceTimestamps.remove(key)
-                        scannedDevicesMap.remove(key)
-                    }
-                }
-            }
+    @SuppressLint("MissingPermission")
+    private fun requestBatteryUpdate() {
+        val service = bluetoothGatt?.getService(SERVICE_UUID)
+        val characteristic = service?.getCharacteristic(CHAR_UUID)
+        if (characteristic != null) {
+            bluetoothGatt?.readCharacteristic(characteristic)
+        }
+    }
 
-            LaunchedEffect(isAlertActive.value, alertSoundType.value, alertAngle.value) {
-                if (isAlertActive.value) {
-                    // The board only notifies while it's actively re-confirming the
-                    // sound (every ~0.25s), so a stopped stream of notifications
-                    // itself means the sound has stopped - this timeout just needs
-                    // to cover a couple of missed BLE packets, not act as the
-                    // primary detector. Was 5000ms, which made the alert visibly
-                    // linger after the sound actually ended.
-                    delay(1500)
-                    isAlertActive.value = false
-                }
-            }
-
-            if (isConnected.value) {
-                val rotationOffset = currentAzimuth.value - initialAzimuth
-                val compensatedAngle = alertAngle.value - rotationOffset
-
-                MainScreen(
-                    isAlertActive = isAlertActive.value,
-                    soundType = alertSoundType.value,
-                    angle = compensatedAngle,
-                    isSettingsOpen = isSettingsOpen.value,
-                    connectedDeviceName = connectedDeviceName.value,
-                    clockColor = clockColor.value,
-                    alertColor = alertColor.value,
-                    vibeStrength = vibeStrength.value,
-                    onOpenSettings = { isSettingsOpen.value = true },
-                    onCloseSettings = { isSettingsOpen.value = false },
-                    onDisconnect = { disconnectFromDevice() },
-                    onClockColorChange = {
-                        clockColor.value = it
-                        settingsPrefs.edit().putInt("clock_color", it.toArgb()).apply()
-                    },
-                    onAlertColorChange = {
-                        alertColor.value = it
-                        settingsPrefs.edit().putInt("alert_color", it.toArgb()).apply()
-                    },
-                    onVibeChange = {
-                        vibeStrength.value = it
-                        settingsPrefs.edit().putInt("vibe_strength", it).apply()
-                        triggerHapticFeedback(this@MainActivity, it)
-                    }
-                )
-            } else {
-                ConnectScreen(
-                    isScanning = isScanning.value,
-                    isConnecting = isConnecting.value,
-                    devices = scannedDevicesMap.values.toList(),
-                    onStartScan = { startBleScan() },
-                    onDeviceClick = { device -> connectToDevice(device) }
-                )
+    private fun checkAutoReconnect() {
+        val lastAddress = prefs.getString("lastDeviceAddress", null)
+        if (lastAddress != null && !isConnected.value) {
+            val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+            val device = bluetoothManager.adapter.getRemoteDevice(lastAddress)
+            if (device != null) {
+                connectedDeviceName.value = prefs.getString("lastDeviceName", "알 수 없는 기기") ?: "알 수 없는 기기"
+                connectToDevice(device)
             }
         }
     }
@@ -215,7 +278,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         rotationSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
@@ -226,30 +289,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
-            val rotationMatrix = FloatArray(9)
             SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-
-            // getOrientation()'s azimuth is defined for a device lying flat
-            // (screen up); a watch is actually viewed tilted toward the wearer's
-            // face, so the raw azimuth is off by however much the wrist is
-            // raised. Remap to the "held upright, screen facing the wearer"
-            // frame (the standard compass-app mapping) before reading azimuth,
-            // per https://developer.android.com/develop/sensors-and-location/sensors/sensors_position.
-            val remappedMatrix = FloatArray(9)
-            SensorManager.remapCoordinateSystem(
-                rotationMatrix, SensorManager.AXIS_X, SensorManager.AXIS_Z, remappedMatrix
-            )
-
-            val orientationAngles = FloatArray(3)
-            SensorManager.getOrientation(remappedMatrix, orientationAngles)
+            SensorManager.getOrientation(rotationMatrix, orientationAngles)
 
             var azimuth = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
             if (azimuth < 0) azimuth += 360f
 
-            // Low-pass filter over the shortest angular path so raw sensor jitter
-            // doesn't show up as small steps in the direction indicator.
-            val shortestDelta = ((azimuth - currentAzimuth.value + 540f) % 360f) - 180f
-            currentAzimuth.value = (currentAzimuth.value + shortestDelta * 0.35f + 360f) % 360f
+            currentAzimuth.floatValue = azimuth
         }
     }
 
@@ -258,10 +304,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     @SuppressLint("MissingPermission")
     private fun startBleScan() {
         try {
-            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
             val bluetoothAdapter = bluetoothManager.adapter
 
-            if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
+            if (bluetoothAdapter == null) return
+
+            if (!bluetoothAdapter.isEnabled) {
+                // 이 로직은 이제 ConnectScreen의 onStartScan에서 처리됨
+                return
+            }
 
             scanner = bluetoothAdapter.bluetoothLeScanner
             if (scanner == null) return
@@ -298,38 +349,38 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     @SuppressLint("MissingPermission")
     private fun connectToDevice(device: BluetoothDevice) {
         isScanning.value = false
-        isConnecting.value = true
         scanner?.stopScan(scanCallback)
-        connectedDeviceName.value = device.name ?: savedDeviceName ?: "알 수 없는 기기"
-        bluetoothGatt = device.connectGatt(this, false, gattCallback)
-    }
+        connectedDeviceName.value = device.name ?: "알 수 없는 기기"
 
-    @SuppressLint("MissingPermission")
-    private fun tryAutoReconnect() {
-        val address = savedDeviceAddress ?: return
-        if (reconnectAttempts >= maxReconnectAttempts) return
-        reconnectAttempts++
-        try {
-            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-            val adapter = bluetoothManager.adapter
-            if (adapter == null || !adapter.isEnabled) return
-            connectToDevice(adapter.getRemoteDevice(address))
-        } catch (e: Exception) {
-            Log.e("BLE", "자동 재연결 실패: ${e.message}")
+        // 연결 정보 저장
+        prefs.edit {
+            putString("lastDeviceAddress", device.address)
+            putString("lastDeviceName", device.name)
+        }
+
+        @Suppress("DEPRECATION")
+        bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, Handler(Looper.getMainLooper()))
+        } else {
+            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun disconnectFromDevice() {
-        userInitiatedDisconnect = true
-        savedDeviceAddress = null
-        savedDeviceName = null
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
         isConnected.value = false
-        isConnecting.value = false
+        esp32BatteryLevel.intValue = -1
+        isEsp32Charging.value = false
         isSettingsOpen.value = false
+
+        // 연결 정보 삭제
+        prefs.edit {
+            remove("lastDeviceAddress")
+            remove("lastDeviceName")
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -338,14 +389,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                gatt.close()
                 isConnected.value = false
-                if (userInitiatedDisconnect) {
-                    userInitiatedDisconnect = false
-                    isConnecting.value = false
-                } else {
-                    tryAutoReconnect()
-                }
             }
         }
 
@@ -359,32 +403,76 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     gatt.setCharacteristicNotification(characteristic, true)
                     val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
                     if (descriptor != null) {
-                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(descriptor)
-                        isConnected.value = true
-                        isConnecting.value = false
-                        reconnectAttempts = 0
-                        savedDeviceAddress = gatt.device.address
-                        gatt.device.name?.let { savedDeviceName = it }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                            @Suppress("DEPRECATION")
+                            gatt.writeDescriptor(descriptor)
+                        }
                     }
                 }
             }
         }
 
+        @SuppressLint("MissingPermission")
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                // Notification 설정이 완료된 후 연결 상태를 true로 변경
+                isConnected.value = true
+            }
+        }
+
+        @Suppress("DEPRECATION")
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                val value = characteristic.value
+                processReceivedData(value, isFromRead = true)
+            }
+        }
+
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            processReceivedData(value, isFromRead = false)
+        }
+
+        @Suppress("DEPRECATION")
+        @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            val receivedData = characteristic.getStringValue(0)
-            val parts = receivedData?.split(",")
+            val value = characteristic.value
+            processReceivedData(value, isFromRead = false)
+        }
 
-            if (parts != null && parts.size == 2) {
-                wakeUpScreen()
+        private fun processReceivedData(value: ByteArray, isFromRead: Boolean) {
+            val receivedData = String(value)
+            val parts = receivedData.split(",")
+            if (parts.size < 2) return
 
-                alertSoundType.value = parts[0].trim().uppercase()
-                alertAngle.value = parts[1].trim().toFloatOrNull() ?: 0f
-                initialAzimuth = currentAzimuth.value
+            val type = parts[0].trim().uppercase()
+            val dataValue = parts[1].trim()
 
-                isSettingsOpen.value = false
-                isAlertActive.value = true
-                triggerHapticFeedback(this@MainActivity, vibeStrength.value, alertSoundType.value)
+            when (type) {
+                "BATT" -> {
+                    esp32BatteryLevel.intValue = dataValue.toIntOrNull() ?: -1
+                    isEsp32Charging.value = if (parts.size >= 3) {
+                        parts[2].trim().uppercase() == "CHARGING"
+                    } else {
+                        false
+                    }
+                }
+                else -> {
+                    if (!isFromRead) {
+                        wakeUpScreen()
+                        alertSoundType.value = type
+                        alertAngle.floatValue = dataValue.toFloatOrNull() ?: 0f
+                        initialAzimuth = currentAzimuth.floatValue
+
+                        isSettingsOpen.value = false
+                        isAlertActive.value = true
+                        triggerHapticFeedback(this@MainActivity, vibeStrength.intValue)
+                    }
+                }
             }
         }
     }
@@ -395,35 +483,26 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
-    private fun triggerHapticFeedback(context: Context, level: Int, soundType: String? = null) {
-        val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-        val vibrator = vibratorManager.defaultVibrator
-
-        // Rhythm depends on the danger type: horn = short/weak single pulse,
-        // siren = strong/repeating pulses. Without a soundType (settings preview),
-        // fall back to the old strength-only pattern.
-        val pattern = when (soundType) {
-            "HORN" -> longArrayOf(0, 60)
-            "SIREN" -> longArrayOf(0, 200, 100, 200, 100, 200, 100, 200)
-            else -> when (level) {
-                0 -> longArrayOf(0, 40)
-                1 -> longArrayOf(0, 80, 80, 80)
-                2 -> longArrayOf(0, 150, 80, 150)
-                else -> longArrayOf(0, 100, 40, 100, 40, 100)
-            }
+    private fun triggerHapticFeedback(context: Context, level: Int) {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
-        // Strength setting (약/중/강/최상) scales amplitude on top of the rhythm.
-        val amplitude = when (level) {
-            0 -> 90
-            1 -> 150
-            2 -> 200
-            else -> 255
-        }
-        val amplitudes = IntArray(pattern.size) { i -> if (i % 2 == 0) 0 else amplitude }
-
-        val effect = VibrationEffect.createWaveform(pattern, amplitudes, -1)
+        val pattern = VIBRATE_PATTERNS.getOrElse(level) { VIBRATE_PATTERNS.last() }
+        val effect = VibrationEffect.createWaveform(pattern, -1)
         vibrator.vibrate(effect)
+    }
+
+    @SuppressLint("MissingPermission")
+    override fun onStop() {
+        super.onStop()
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -431,9 +510,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         super.onDestroy()
         scanner?.stopScan(scanCallback)
         bluetoothGatt?.close()
-        if (wakeLock?.isHeld == true) {
-            wakeLock?.release()
-        }
     }
 }
 
@@ -443,7 +519,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 @Composable
 fun ConnectScreen(
     isScanning: Boolean,
-    isConnecting: Boolean,
     devices: List<BluetoothDevice>,
     onStartScan: () -> Unit,
     onDeviceClick: (BluetoothDevice) -> Unit
@@ -453,9 +528,7 @@ fun ConnectScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        if (isConnecting) {
-            Text("이전 기기에 재연결 중...", color = Color.White, fontSize = 14.sp)
-        } else if (!isScanning && devices.isEmpty()) {
+        if (!isScanning && devices.isEmpty()) {
             Box(
                 modifier = Modifier.background(Color.DarkGray, RoundedCornerShape(20.dp)).clickable { onStartScan() }.padding(16.dp)
             ) { Text("기기 검색 시작", color = Color.White, fontSize = 16.sp) }
@@ -512,6 +585,8 @@ fun MainScreen(
     clockColor: Color,
     alertColor: Color,
     vibeStrength: Int,
+    esp32BatteryLevel: Int,
+    isEsp32Charging: Boolean,
     onOpenSettings: () -> Unit,
     onCloseSettings: () -> Unit,
     onDisconnect: () -> Unit,
@@ -534,19 +609,58 @@ fun MainScreen(
             onVibeChange = onVibeChange
         )
     } else {
-        DigitalClockScreen(clockColor = clockColor, onOpenSettings = onOpenSettings)
+        DigitalClockScreen(
+            clockColor = clockColor,
+            esp32BatteryLevel = esp32BatteryLevel,
+            isEsp32Charging = isEsp32Charging,
+            onOpenSettings = onOpenSettings
+        )
     }
 }
 
 @Composable
-fun DigitalClockScreen(clockColor: Color, onOpenSettings: () -> Unit) {
+fun DigitalClockScreen(
+    clockColor: Color,
+    esp32BatteryLevel: Int,
+    isEsp32Charging: Boolean,
+    onOpenSettings: () -> Unit
+) {
     var currentTime by remember { mutableStateOf("") }
+    var batteryLevel by remember { mutableIntStateOf(100) }
+    var isCharging by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
 
+    // 시계 업데이트 (1초마다)
     LaunchedEffect(Unit) {
         while (true) {
             val sdf = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
             currentTime = sdf.format(Date())
-            delay(1000)
+            delay(1000.milliseconds)
+        }
+    }
+
+    // 배터리 상태 업데이트 (이벤트 발생 시에만)
+    DisposableEffect(Unit) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                intent?.let {
+                    val level = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                    val scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                    if (level != -1 && scale != -1) {
+                        batteryLevel = (level * 100 / scale.toFloat()).toInt()
+                    }
+
+                    val status = it.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                    isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                            status == BatteryManager.BATTERY_STATUS_FULL
+                }
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        context.registerReceiver(receiver, filter)
+
+        onDispose {
+            context.unregisterReceiver(receiver)
         }
     }
 
@@ -554,6 +668,7 @@ fun DigitalClockScreen(clockColor: Color, onOpenSettings: () -> Unit) {
         modifier = Modifier.fillMaxSize().background(Color.Black),
         contentAlignment = Alignment.Center
     ) {
+        // 설정 버튼
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -572,30 +687,88 @@ fun DigitalClockScreen(clockColor: Color, onOpenSettings: () -> Unit) {
             )
         }
 
-        Text(
-            text = currentTime,
-            color = clockColor,
-            fontSize = 36.sp,
-            fontWeight = FontWeight.Bold
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.offset(y = (-5).dp)
+        ) {
+            val batteryIcon = when {
+                isCharging -> Icons.Default.BatteryChargingFull
+                batteryLevel <= 15 -> Icons.Default.BatteryAlert
+                batteryLevel <= 25 -> Icons.Default.Battery0Bar
+                batteryLevel <= 35 -> Icons.Default.Battery1Bar
+                batteryLevel <= 45 -> Icons.Default.Battery2Bar
+                batteryLevel <= 55 -> Icons.Default.Battery3Bar
+                batteryLevel <= 70 -> Icons.Default.Battery4Bar
+                batteryLevel <= 85 -> Icons.Default.Battery5Bar
+                batteryLevel <= 95 -> Icons.Default.Battery6Bar
+                else -> Icons.Default.BatteryFull
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // 워치 배터리
+                Icon(
+                    imageVector = batteryIcon,
+                    contentDescription = "Watch Battery",
+                    tint = Color.White,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "$batteryLevel%",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+
+                // ESP32 배터리가 있는 경우에만 표시
+                if (esp32BatteryLevel != -1) {
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    val esp32BatteryIcon = when {
+                        isEsp32Charging -> Icons.Default.BatteryChargingFull
+                        esp32BatteryLevel <= 15 -> Icons.Default.BatteryAlert
+                        esp32BatteryLevel <= 25 -> Icons.Default.Battery0Bar
+                        esp32BatteryLevel <= 35 -> Icons.Default.Battery1Bar
+                        esp32BatteryLevel <= 45 -> Icons.Default.Battery2Bar
+                        esp32BatteryLevel <= 55 -> Icons.Default.Battery3Bar
+                        esp32BatteryLevel <= 70 -> Icons.Default.Battery4Bar
+                        esp32BatteryLevel <= 85 -> Icons.Default.Battery5Bar
+                        esp32BatteryLevel <= 95 -> Icons.Default.Battery6Bar
+                        else -> Icons.Default.BatteryFull
+                    }
+
+                    Icon(
+                        imageVector = esp32BatteryIcon,
+                        contentDescription = "ESP32 Battery",
+                        tint = Color(0xFF00E5FF), // ESP32 배터리는 다른 색상으로 구분
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "$esp32BatteryLevel%",
+                        color = Color(0xFF00E5FF),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Text(
+                text = currentTime,
+                color = clockColor,
+                fontSize = 36.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
     }
 }
 
 @Composable
 fun AlertScreen(soundType: String, angle: Float, themeColor: Color) {
     val cleanSoundType = soundType.trim().uppercase()
-    val alertIcon = if (cleanSoundType == "SIREN") Icons.Default.NotificationsActive else Icons.Default.VolumeUp
-
-    // Animate toward the new angle along the shortest path instead of snapping,
-    // so both new BLE readings and watch rotation feel like continuous motion.
-    val animatedAngle = remember { Animatable(angle) }
-    LaunchedEffect(angle) {
-        val shortestDelta = ((angle - animatedAngle.value + 540f) % 360f) - 180f
-        animatedAngle.animateTo(
-            animatedAngle.value + shortestDelta,
-            animationSpec = tween(durationMillis = 150, easing = LinearEasing)
-        )
-    }
+    val alertIcon = if (cleanSoundType == "SIREN") Icons.Default.NotificationsActive else Icons.AutoMirrored.Filled.VolumeUp
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -603,7 +776,7 @@ fun AlertScreen(soundType: String, angle: Float, themeColor: Color) {
             drawCircle(color = Color.DarkGray, style = Stroke(width = strokeWidth))
             drawArc(
                 color = themeColor,
-                startAngle = animatedAngle.value - 90f - 30f,
+                startAngle = angle - 90f - 30f,
                 sweepAngle = 60f,
                 useCenter = false,
                 style = Stroke(width = strokeWidth)

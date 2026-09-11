@@ -17,6 +17,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_adc/adc_oneshot.h"
+#include "driver/gpio.h"
+#include "esp_sleep.h"
+
 // BLE (ESP-IDF NimBLE)
 #include "esp_mac.h"
 #include "nvs_flash.h"
@@ -39,6 +43,20 @@
 
 namespace {
 constexpr char TAG[] = "GEEKBLE_AI";
+
+// --- Power & Deep Sleep (ex1/ekkukdl 이식: GPIO13/A6 배터리 ADC + GPIO12 버튼 딥슬립) ---
+constexpr gpio_num_t BUTTON_PIN = GPIO_NUM_12; // Geekble Nano A5 pin
+constexpr adc_channel_t BATT_ADC_CHAN = ADC_CHANNEL_2; // GPIO13 (A6)
+static adc_oneshot_unit_handle_t adc_handle = NULL;
+constexpr int BATTERY_CAPACITY_MAH = 2000;
+constexpr gpio_num_t LED_BUILTIN_PIN = GPIO_NUM_48;
+constexpr int64_t FAKE_CHARGE_INTERVAL_US = BATTERY_CAPACITY_MAH * 36000LL * 1000LL;
+
+static float previous_voltage = 0.0f;
+static bool is_charging = false;
+static int current_battery_pct = 0;
+static int64_t last_internal_batt_check = 0;
+static int64_t last_fake_charge_time = 0;
 
 // -----------------------------------------------------------------------------
 // BLE: same Service / Characteristic UUIDs as BLE_connect_namming.ino.
@@ -98,7 +116,7 @@ static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t ble_char_val_handle = 0;
 static volatile bool ble_notify_enabled = false;
 static char ble_device_name[40] = "ESP32_AUDIO_ALERT";
-static char ble_last_payload[32] = "none, 90.0";
+static char ble_last_payload[32] = "none, 0.0";
 static ble_gatt_chr_def ble_characteristics[2] = {};
 static ble_gatt_svc_def ble_services[2] = {};
 
@@ -379,15 +397,118 @@ static bool init_ble() {
     return true;
 }
 
+static float getBatteryVoltage() {
+    long raw_sum = 0;
+    int num_samples = 100;
+    for (int i = 0; i < num_samples; i++) {
+        int raw = 0;
+        adc_oneshot_read(adc_handle, BATT_ADC_CHAN, &raw);
+        raw_sum += raw;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    float smoothed_raw_val = raw_sum / (float)num_samples;
+    float pin_voltage = (smoothed_raw_val / 4095.0f) * 3.3f;
+    return pin_voltage * 2.0f;
+}
+
+static void updateBatteryStatus() {
+    float current_voltage = getBatteryVoltage();
+    if (previous_voltage > 0.0f) {
+        float voltage_diff = current_voltage - previous_voltage;
+        if (!is_charging && voltage_diff > 0.05f) {
+            ESP_LOGI(TAG, "Charge detected. Waiting 500ms for stabilization...");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            current_voltage = getBatteryVoltage();
+            is_charging = true;
+            last_fake_charge_time = esp_timer_get_time();
+            ESP_LOGI(TAG, "Charging confirmed. Current pct: %d%%", current_battery_pct);
+        } else if (is_charging && voltage_diff < -0.05f) {
+            ESP_LOGI(TAG, "Discharge detected. Waiting 1000ms for stabilization...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            current_voltage = getBatteryVoltage();
+            is_charging = false;
+            ESP_LOGI(TAG, "Discharging confirmed.");
+        }
+    }
+    previous_voltage = current_voltage;
+
+    // Li-ion 3.7V discharge curve (linear, 3.0V~4.2V -> 0%~100%)
+    int calculated_pct = (int)(((current_voltage - 3.0f) / 1.2f) * 100.0f);
+    if (calculated_pct > 100) calculated_pct = 100;
+    if (calculated_pct < 0) calculated_pct = 0;
+
+    if (is_charging) {
+        // Avoid jumping straight to 100% off the charger's 4.2V rail: only
+        // the fake-charge timer ticks the displayed percent up, slowly.
+        if (esp_timer_get_time() - last_fake_charge_time >= FAKE_CHARGE_INTERVAL_US) {
+            current_battery_pct++;
+            if (current_battery_pct > 100) current_battery_pct = 100;
+            last_fake_charge_time = esp_timer_get_time();
+            ESP_LOGI(TAG, "Fake charge timer increment: %d%%", current_battery_pct);
+        }
+    } else {
+        current_battery_pct = calculated_pct;
+    }
+}
+
+static void ble_send_battery() {
+    char batData[32];
+    std::snprintf(batData, sizeof(batData), "BATT,%d,%s",
+                  current_battery_pct, is_charging ? "CHARGING" : "DISCHARGING");
+
+    if (ble_conn_handle == BLE_HS_CONN_HANDLE_NONE || !ble_notify_enabled) {
+        return;
+    }
+    os_mbuf* om = ble_hs_mbuf_from_flat(batData, std::strlen(batData));
+    if (om) {
+        ble_gatts_notify_custom(ble_conn_handle, ble_char_val_handle, om);
+    }
+}
+
+static void init_power_management() {
+    gpio_config_t led_conf = {};
+    led_conf.pin_bit_mask = (1ULL << LED_BUILTIN_PIN);
+    led_conf.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&led_conf);
+    gpio_set_level(LED_BUILTIN_PIN, 1); // HIGH to indicate awake (Active-High)
+
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    adc_oneshot_unit_init_cfg_t init_config = {};
+    init_config.unit_id = ADC_UNIT_2; // A6(GPIO13) uses ADC2
+    adc_oneshot_new_unit(&init_config, &adc_handle);
+    adc_oneshot_chan_cfg_t config = {};
+    config.bitwidth = ADC_BITWIDTH_DEFAULT;
+    config.atten = ADC_ATTEN_DB_12;
+    adc_oneshot_config_channel(adc_handle, BATT_ADC_CHAN, &config);
+
+    updateBatteryStatus();
+    last_internal_batt_check = esp_timer_get_time();
+    ESP_LOGI(TAG, "Power management initialized. Batt: %d%%", current_battery_pct);
+}
+
 static bool ble_send_sound(const char* sound_name) {
     if (!sound_name) return false;
 
     // Ask the TDOA board for its angle right now, at classification time,
     // instead of relying on a stale background UART cache.
-    float angle = DEFAULT_ANGLE_DEG;
+    float angle = 0.0f;
     if (!request_angle_sync(angle)) {
-        ESP_LOGW(TAG, "GET_ANGLE request timed out; using default %.1f", angle);
+        ESP_LOGW(TAG, "GET_ANGLE request timed out. Skipping BLE notification.");
+        return false;
     }
+
+    // Default angle (90.0) means the TDOA board never answered with a real
+    // reading either - skip rather than alert with a made-up direction.
+    if (angle == 90.0f) {
+        ESP_LOGW(TAG, "Received default angle (90.0). Skipping BLE notification.");
+        return false;
+    }
+
     std::snprintf(ble_last_payload, sizeof(ble_last_payload),
                   "%s, %.1f", sound_name, angle);
 
@@ -1051,6 +1172,7 @@ extern "C" void app_main(void) {
     if (!init_ble()) stop_forever("BLE initialization failed");
     if (!init_angle_uart()) stop_forever("Angle UART initialization failed");
     if (!init_microphone()) stop_forever("INMP441 initialization failed");
+    init_power_management();
 
     ESP_LOGI(TAG, "Filling initial 2-second window...");
     for (;;) {
@@ -1084,6 +1206,33 @@ extern "C" void app_main(void) {
             ESP_LOGE(TAG, "Microphone data fixed at 0/-1; check wiring/soldering");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
+        }
+
+        // Deep sleep: short click on the button.
+        if (gpio_get_level(BUTTON_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (gpio_get_level(BUTTON_PIN) == 0) {
+                ESP_LOGI(TAG, "Deep sleep button pressed. Going to sleep.");
+                gpio_set_level(LED_BUILTIN_PIN, 0); // LOW for sleep (Active-High)
+                while (gpio_get_level(BUTTON_PIN) == 0) { vTaskDelay(pdMS_TO_TICKS(10)); }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
+                esp_deep_sleep_start();
+            }
+        }
+
+        // Battery check every 2 seconds.
+        if (esp_timer_get_time() - last_internal_batt_check > 2000000LL) {
+            bool old_charging_state = is_charging;
+            int old_pct = current_battery_pct;
+
+            updateBatteryStatus();
+
+            if (old_charging_state != is_charging || old_pct != current_battery_pct) {
+                ble_send_battery();
+                ESP_LOGI(TAG, "Battery status changed -> Notified watch");
+            }
+            last_internal_batt_check = esp_timer_get_time();
         }
 
         float raw_rms = 0.0f;
@@ -1135,7 +1284,13 @@ extern "C" void app_main(void) {
             consecutive_count = (best == consecutive_class) ? consecutive_count + 1 : 1;
             consecutive_class = best;
             if (consecutive_count >= CONSECUTIVE_REQUIRED) {
-                ble_send_sound(SOUND_CLASS_NAMES[best]);
+                // Ignore detections in the first 5s after boot - mic pop/settling
+                // noise, not a real event.
+                if (esp_timer_get_time() < 5000000LL) {
+                    ESP_LOGI(TAG, "Ignoring detection during startup stabilization: %s", SOUND_CLASS_NAMES[best]);
+                } else {
+                    ble_send_sound(SOUND_CLASS_NAMES[best]);
+                }
             }
         } else {
             consecutive_class = -1;

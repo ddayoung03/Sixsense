@@ -1,10 +1,10 @@
-package com.example.soundcompass.presentation.theme
+package com.example.sixsense.presentation.theme
 
 import androidx.compose.runtime.Composable
 import androidx.wear.compose.material3.MaterialTheme
 
 @Composable
-fun SoundCompassTheme(
+fun SixSenseTheme(
     content: @Composable () -> Unit
 ) {
     /**

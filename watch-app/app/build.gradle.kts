@@ -4,13 +4,13 @@ plugins {
 }
 
 android {
-    namespace = "com.example.soundcompass"
+    namespace = "com.example.sixsense"
     compileSdk {
         version = release(37)
     }
 
     defaultConfig {
-        applicationId = "com.example.soundcompass"
+        applicationId = "com.example.sixsense"
         minSdk = 30
         targetSdk = 37
         versionCode = 1
