@@ -633,7 +633,14 @@ static bool request_angle_sync(float& angle_out) {
     char line[32] = {};
     size_t used = 0;
     uint8_t ch = 0;
-    const int64_t deadline_us = esp_timer_get_time() + 200000;  // 200ms timeout
+    // 200ms was sized for the old single-core TDOA, where a response could be
+    // delayed by up to one busy compute frame (~64ms+). Since TDOA's UART is
+    // now answered by its own core1 task regardless of core0's compute state
+    // (see tdoa_connect.ino), a real response arrives in ~1-2ms; 30ms still
+    // leaves a comfortable margin. This mainly matters when TDOA has no valid
+    // angle yet (answers the out-of-range sentinel, rejected by
+    // parse_angle_line) - that path used to burn the full 200ms every time.
+    const int64_t deadline_us = esp_timer_get_time() + 30000;  // 30ms timeout
 
     while (esp_timer_get_time() < deadline_us) {
         const int n = uart_read_bytes(ANGLE_UART_PORT, &ch, 1, pdMS_TO_TICKS(20));
