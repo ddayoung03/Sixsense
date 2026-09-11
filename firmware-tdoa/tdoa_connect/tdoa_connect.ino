@@ -40,10 +40,13 @@
 // 0.7이면 선명도 대부분을 유지하면서 잡음-only 빈의 과증폭을 억제(반향에 강함).
 #define PHAT_BETA           0.7f
 // EMA 앞단 중앙값 필터 길이(홀수). 단일 프레임 튐 제거용.
-#define MED_LEN             3
+// 1 = 사실상 비활성(중앙값이 곧 최신값) - 반응속도 우선.
+#define MED_LEN             1
 // 💡 0에 가까울수록 부드럽지만(잡음에 강하지만) 소리가 움직일 때 반응이 느려지고,
 // 1에 가까울수록 반응은 빠르지만 잡음(떨림)이 그대로 각도에 드러납니다.
-#define DELAY_EMA_ALPHA     0.35f
+// 0.35 -> 0.5: 스텝 변화가 95% 수렴하는 데 걸리는 시간이 ~7프레임(448ms)에서
+// ~4.3프레임(277ms)으로 줄어듦 (64ms 프레임 기준).
+#define DELAY_EMA_ALPHA     0.5f
 #define USE_BANDPASS        true
 #define MIN_FREQ            200.0f
 #define MAX_FREQ            5000.0f
