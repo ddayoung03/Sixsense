@@ -16,3 +16,8 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# app_main (mic capture, core0) must stay real-time; keep the NimBLE host
+# task on core1 with infer_task instead of the ESP-IDF default (core0), so
+# BLE GATT/GAP events never compete with audio capture for core0 cycles.
+CONFIG_BT_NIMBLE_PINNED_TO_CORE=1

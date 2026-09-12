@@ -36,6 +36,7 @@
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+#include "dsps_fft2r.h"
 #include "fft512.h"
 #include "labels.h"
 #include "mel_filterbank.h"
@@ -203,8 +204,11 @@ int16_t* ring_pcm = nullptr;    // continuously-filled circular capture buffer, 
 uint32_t ring_write_pos = 0;
 float* log_mel_buffer = nullptr;
 
-float fft_real[FFT_SIZE];
-float fft_imag[FFT_SIZE];
+// Interleaved complex scratch buffer for esp-dsp's FFT: Re[0],Im[0],...,Re[N-1],Im[N-1].
+// esp-dsp picks the ESP32-S3 SIMD-assembly kernel (dsps_fft2r_fc32_aes3) for this
+// automatically - same unnormalized radix-2 DFT math as the old hand-rolled
+// fft512_forward(), just hardware-accelerated, so Log-Mel output is unchanged.
+float fft_iq[FFT_SIZE * 2];
 float power_spectrum[FFT_BINS];
 
 i2s_chan_handle_t rx_handle = nullptr;
@@ -523,7 +527,10 @@ static void init_power_management() {
 
     updateBatteryStatus();
     ESP_LOGI(TAG, "Power management initialized. Batt: %d%%", current_battery_pct);
-    xTaskCreate(battery_task, "battery_task", 4096, nullptr, 1, nullptr);
+    // Pinned to core1 (with infer_task), not left to the scheduler's default
+    // affinity, so its ADC-read loop can never land on core0 and jitter the
+    // real-time mic capture loop in app_main.
+    xTaskCreatePinnedToCore(battery_task, "battery_task", 4096, nullptr, 1, nullptr, 1);
 }
 
 static bool ble_send_sound(const char* sound_name) {
@@ -1093,15 +1100,17 @@ bool build_quantized_logmel_input(const RmsNormStats& norm) {
                     (static_cast<float>(audio_pcm[src]) - norm.mean_pcm16) * norm.gain / 32768.0f;
                 sample = clamp_float(sample, -1.0f, 1.0f);
             }
-            fft_real[n] = sample * HANN_WINDOW[n];
-            fft_imag[n] = 0.0f;
+            fft_iq[2 * n] = sample * HANN_WINDOW[n];
+            fft_iq[2 * n + 1] = 0.0f;
         }
 
-        fft512_forward(fft_real, fft_imag);
+        dsps_fft2r_fc32(fft_iq, FFT_SIZE);
+        dsps_bit_rev_fc32(fft_iq, FFT_SIZE);
 
         for (uint16_t bin = 0; bin < FFT_BINS; ++bin) {
-            power_spectrum[bin] =
-                fft_real[bin] * fft_real[bin] + fft_imag[bin] * fft_imag[bin];
+            const float re = fft_iq[2 * bin];
+            const float im = fft_iq[2 * bin + 1];
+            power_spectrum[bin] = re * re + im * im;
         }
 
         for (uint16_t mel = 0; mel < MEL_BANDS; ++mel) {
@@ -1293,6 +1302,7 @@ extern "C" void app_main(void) {
     std::printf("=======================================================\n");
 
     if (!allocate_buffers()) stop_forever("Memory allocation failed");
+    if (dsps_fft2r_init_fc32(NULL, FFT_SIZE) != ESP_OK) stop_forever("esp-dsp FFT init failed");
     if (!init_model()) stop_forever("TFLite v3.2 model initialization failed");
     if (!init_ble()) stop_forever("BLE initialization failed");
     if (!init_angle_uart()) stop_forever("Angle UART initialization failed");
