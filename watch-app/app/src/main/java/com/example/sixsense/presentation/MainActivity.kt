@@ -387,6 +387,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                // 경고음 알림 지연을 줄이기 위해 기본(BALANCED) 연결 인터벌 대신
+                // 가장 짧은 인터벌을 요청한다 - 배터리보다 반응속도가 중요한 앱이라
+                // 이 트레이드오프가 맞다.
+                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isConnected.value = false
