@@ -199,6 +199,15 @@ uint8_t* tensor_arena = nullptr;
 int16_t* audio_pcm_bufs[2] = {nullptr, nullptr};
 int16_t* audio_pcm = nullptr;   // "current" buffer for this inference cycle - set by infer_task
 float raw_rms_bufs[2] = {0.0f, 0.0f};
+// Single-writer-per-side guard on top of the ping-pong above: capture_task
+// sets buf_in_use[i]=true right before handing a half to infer_task, which
+// clears it back to false as soon as it's done reading audio_pcm from that
+// half. This turns the ~1s timing margin from an assumption into an
+// enforced one - if infer_task is ever preempted (eg. by the NimBLE host
+// task sharing this core at a higher priority) long enough to still be
+// reading a half when capture_task wants to reuse it, capture_task skips
+// that hop's handoff instead of racing a write against infer_task's read.
+volatile bool buf_in_use[2] = {false, false};
 TaskHandle_t infer_task_handle = nullptr;
 int16_t* ring_pcm = nullptr;    // continuously-filled circular capture buffer, size SAMPLE_COUNT
 uint32_t ring_write_pos = 0;
@@ -1231,6 +1240,7 @@ void infer_task(void*) {
         if (raw_rms < RMS_GATE_PCM16) {
             std::printf("RMS %.2f < %.2f -> inference SKIPPED\n",
                         raw_rms, RMS_GATE_PCM16);
+            buf_in_use[buf_idx] = false;
             continue;
         }
 
@@ -1238,12 +1248,17 @@ void infer_task(void*) {
         RmsNormStats norm;
         if (!prepare_rms_normalization(raw_rms, norm)) {
             std::printf("RMS normalization failed/empty input -> skipped\n");
+            buf_in_use[buf_idx] = false;
             continue;
         }
 
         // Step 3: same librosa-compatible Log-Mel -> new model's INT8 quantization.
+        // This is the last step that reads audio_pcm, so the buffer half is
+        // free for capture_task to reuse as soon as it returns (success or not).
         const int64_t preprocess_start = esp_timer_get_time();
-        if (!build_quantized_logmel_input(norm)) {
+        const bool logmel_ok = build_quantized_logmel_input(norm);
+        buf_in_use[buf_idx] = false;
+        if (!logmel_ok) {
             ESP_LOGE(TAG, "Log-Mel preprocessing failed");
             continue;
         }
@@ -1368,9 +1383,17 @@ extern "C" void app_main(void) {
 
         // Snapshot into whichever half infer_task isn't using, then hand it
         // off. Ping-pongs every hop; infer_task's ~508ms of work comfortably
-        // finishes within the ~1s before this same half is reused again.
-        snapshot_window_and_rms(audio_pcm_bufs[next_buf], raw_rms_bufs[next_buf]);
-        xTaskNotify(infer_task_handle, static_cast<uint32_t>(next_buf), eSetValueWithOverwrite);
+        // finishes within the ~1s before this same half is reused again -
+        // but if infer_task is still marked busy on this half (eg. delayed
+        // by the NimBLE host task preempting it on core1), skip this hop's
+        // handoff rather than overwrite the half while infer_task reads it.
+        if (buf_in_use[next_buf]) {
+            ESP_LOGW(TAG, "infer_task still busy with buffer %d - skipping this hop", next_buf);
+        } else {
+            buf_in_use[next_buf] = true;
+            snapshot_window_and_rms(audio_pcm_bufs[next_buf], raw_rms_bufs[next_buf]);
+            xTaskNotify(infer_task_handle, static_cast<uint32_t>(next_buf), eSetValueWithOverwrite);
+        }
         next_buf ^= 1;
     }
 }
